@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: threadmark
+      POSTGRES_USER: threadmark
+      POSTGRES_PASSWORD: threadmark
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U threadmark"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    volumes:
+      - threadmark-postgres:/var/lib/postgresql/data
+
+  threadmark:
+    build: .
+    environment:
+      DATABASE_URL: postgres://threadmark:threadmark@postgres:5432/threadmark
+      LISTEN_ADDR: 0.0.0.0:8090
+    ports:
+      - "8090:8090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  threadmark-postgres:
