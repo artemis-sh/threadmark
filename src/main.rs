@@ -1,7 +1,11 @@
 mod api;
+mod capability;
+mod config;
 mod error;
+mod files;
 mod ids;
 mod model;
+mod object_store;
 mod store;
 
 use anyhow::Context;
@@ -18,11 +22,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
-    let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8090".into());
+    let config = config::Config::from_env()?;
     let pool = PgPoolOptions::new()
         .max_connections(20)
-        .connect(&database_url)
+        .connect(&config.database_url)
         .await
         .context("connect to Postgres")?;
 
@@ -31,14 +34,24 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("run migrations")?;
 
-    let listener = TcpListener::bind(&listen_addr)
+    let object_store = object_store::ObjectStore::new(&config);
+    object_store.ping().await.context("access S3 bucket")?;
+
+    let listener = TcpListener::bind(&config.listen_addr)
         .await
-        .with_context(|| format!("bind {listen_addr}"))?;
-    info!(address = %listen_addr, "Threadmark listening");
-    axum::serve(listener, api::router(pool))
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("serve HTTP")?;
+        .with_context(|| format!("bind {}", config.listen_addr))?;
+    info!(address = %config.listen_addr, "Threadmark listening");
+    axum::serve(
+        listener,
+        api::router(api::AppState {
+            pool,
+            object_store,
+            config,
+        }),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("serve HTTP")?;
     Ok(())
 }
 

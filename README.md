@@ -22,8 +22,44 @@ primitive:
   database schema.
 
 Threadmark is not an agent runtime. It does not call agents, proxy SSE streams,
-store attachments, or interpret extension items. JSON items are intentionally
-opaque to the core ledger.
+or interpret extension items. JSON items are intentionally opaque to the core
+ledger. It does own optional S3-backed files so multimodal references remain
+portable across clients and agents.
+
+### Multimodal items
+
+Images, files, audio, video, and future content-part extensions are preserved
+as opaque JSON. Current Open Responses `input_image` parts may carry a remote
+URL or data URL, and `input_file` parts may carry `file_url` or inline
+`file_data`; Threadmark stores and replays each form without rewriting nested
+content. Unknown media part types receive the same treatment.
+
+The HTTP JSON body limit is 64 MiB so a request can contain the protocol's
+roughly 32 MiB maximum inline file plus its JSON envelope. Large multi-file
+batches should use separate append requests.
+
+Threadmark-owned objects will use canonical URIs rather than application-local
+sentinels:
+
+```text
+threadmark://files/file_01k2example
+```
+
+The URI authority identifies the resource class (`files`) and the path carries
+the opaque resource ID. Stored transcript items keep this durable URI. Replay
+can resolve it according to the receiving agent's delivery policy:
+
+| `file_delivery` | Projection |
+| --- | --- |
+| `preserve` | Keep the canonical `threadmark://` URI (default) |
+| `capability_url` | Mint an expiring, signed Threadmark HTTPS download URL |
+| `presigned_url` | Mint a direct S3 URL using `S3_PUBLIC_URL` |
+| `inline` | Read S3 bytes and emit `file_data` or an image data URL |
+
+Consumers must not send the `threadmark://` URI directly to a model provider
+that only accepts HTTP(S) or data URLs. Append rejects Threadmark file URIs that
+do not resolve to a file owned by the conversation principal. A file referenced
+by any conversation cannot be deleted.
 
 ## Status
 
@@ -51,12 +87,22 @@ docker compose up --build
 Or start only Postgres and run the Rust service locally:
 
 ```bash
-docker compose up -d postgres
-DATABASE_URL=postgres://threadmark:threadmark@localhost:5434/threadmark cargo run
+docker compose up -d postgres minio bucket-init
+set -a; source .env; set +a
+cargo run
 ```
 
 Migrations run automatically at startup. The API listens on port `8090` by
 default, and `GET /health` checks database connectivity.
+
+The S3-compatible bucket must exist before Threadmark starts. Compose creates a
+local MinIO bucket automatically. In production, configure `S3_ENDPOINT`,
+`S3_BUCKET`, credentials, and optionally a separately reachable
+`S3_PUBLIC_URL` for direct presigned delivery.
+
+With the stack running, `scripts/media-smoke.sh` verifies upload, all replay
+delivery policies, byte integrity, ownership isolation, and referenced-file
+deletion protection. It requires `curl`, `jq`, `sha256sum`, and `base64`.
 
 ## Identity boundary
 
@@ -120,8 +166,20 @@ curl -sS http://localhost:8090/v1/conversations/conv_.../replay \
   -H 'content-type: application/json' \
   -H 'x-threadmark-tenant: acme' \
   -H 'x-threadmark-principal: user_123' \
-  -d '{"after_seq":0,"strip_top_level_ids":true}'
+  -d '{"after_seq":0,"strip_top_level_ids":true,"file_delivery":"capability_url"}'
 ```
+
+Upload a file before referencing it in an item:
+
+```bash
+curl -sS http://localhost:8090/v1/files \
+  -H 'x-threadmark-tenant: acme' \
+  -H 'x-threadmark-principal: user_123' \
+  -F 'file=@./report.pdf'
+```
+
+The response contains a durable `threadmark://files/file_...` URI. Store that
+URI in an `input_file.file_url` or `input_image.image_url` part.
 
 Record the checkpoint represented by an agent's completed response:
 
@@ -156,6 +214,10 @@ GET /v1/continuations/resp_abc?agent_ref=research-agent%2Fprod
 | `PATCH` | `/v1/turns/{id}` | Update turn state and outcome |
 | `POST` | `/v1/conversations/{id}/continuations` | Record an agent checkpoint |
 | `GET` | `/v1/continuations/{response_id}` | Resolve an agent checkpoint |
+| `POST` | `/v1/files` | Upload a tenant-owned S3-backed file |
+| `GET` | `/v1/files/{id}` | Read owned file metadata |
+| `DELETE` | `/v1/files/{id}` | Delete an unreferenced owned file |
+| `GET` | `/v1/capabilities/files/{id}` | Download through a signed capability |
 
 ## Design notes
 
@@ -169,3 +231,5 @@ GET /v1/continuations/resp_abc?agent_ref=research-agent%2Fprod
   A future capability system must prevent ordinary UI clients from reading it.
 - The replay endpoint is a convenience projection, not summarization. The
   canonical item ledger remains lossless.
+- Capability signatures bind tenant, owner, file ID, and expiry. Capability
+  failures return `404` to avoid exposing file existence.

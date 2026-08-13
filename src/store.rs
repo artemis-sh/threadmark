@@ -1,12 +1,17 @@
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::{
+    api::AppState,
+    capability,
     error::{ApiError, ApiResult},
+    files,
     ids::new_id,
     model::{
         Actor, AppendItems, AppendResult, Continuation, Conversation, CreateContinuation,
-        CreateConversation, CreateTurn, Item, ReplayRequest, ReplayResult, Turn, UpdateTurn,
+        CreateConversation, CreateTurn, FileDelivery, Item, ReplayRequest, ReplayResult, Turn,
+        UpdateTurn,
     },
 };
 
@@ -113,6 +118,11 @@ pub async fn append_items(
             "each item must be a JSON object".into(),
         ));
     }
+    for payload in &request.items {
+        for file_id in referenced_file_ids(payload) {
+            files::get_owned(pool, actor, &file_id).await?;
+        }
+    }
 
     let mut tx = pool.begin().await?;
     let conversation = lock_conversation(&mut tx, actor, conversation_id).await?;
@@ -198,13 +208,41 @@ pub async fn append_items(
     })
 }
 
+fn referenced_file_ids(value: &Value) -> Vec<String> {
+    fn visit(value: &Value, ids: &mut Vec<String>) {
+        match value {
+            Value::String(value) => {
+                if let Some(id) = files::parse_uri(value) {
+                    ids.push(id.to_owned());
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    visit(value, ids);
+                }
+            }
+            Value::Object(values) => {
+                for value in values.values() {
+                    visit(value, ids);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut ids = Vec::new();
+    visit(value, &mut ids);
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 pub async fn replay(
-    pool: &PgPool,
+    state: &AppState,
     actor: &Actor,
     conversation_id: &str,
     request: ReplayRequest,
 ) -> ApiResult<ReplayResult> {
-    let conversation = get_conversation(pool, actor, conversation_id).await?;
+    let conversation = get_conversation(&state.pool, actor, conversation_id).await?;
     let maximum = conversation.next_seq - 1;
     let through_seq = request.through_seq.unwrap_or(maximum).min(maximum);
     if through_seq < request.after_seq.max(0) {
@@ -219,23 +257,108 @@ pub async fn replay(
     .bind(conversation_id)
     .bind(request.after_seq.max(0))
     .bind(through_seq)
-    .fetch_all(pool)
+    .fetch_all(&state.pool)
     .await?;
-    let input = rows
-        .into_iter()
-        .filter_map(|mut item| {
-            let object = item.as_object_mut()?;
-            if request.strip_top_level_ids {
-                object.remove("id");
-            }
-            Some(item)
-        })
-        .collect();
+    let mut input = project_replay_items(rows, request.strip_top_level_ids);
+    if request.file_delivery != FileDelivery::Preserve {
+        for item in &mut input {
+            hydrate_file_references(state, actor, item, request.file_delivery).await?;
+        }
+    }
     Ok(ReplayResult {
         conversation_id: conversation_id.into(),
         through_seq,
         input,
     })
+}
+
+async fn hydrate_file_references(
+    state: &AppState,
+    actor: &Actor,
+    item: &mut Value,
+    delivery: FileDelivery,
+) -> ApiResult<()> {
+    let Some(content) = item
+        .as_object_mut()
+        .and_then(|item| item.get_mut("content"))
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    for part in content {
+        let Some(object) = part.as_object_mut() else {
+            continue;
+        };
+        let part_type = object.get("type").and_then(Value::as_str);
+        let field = match part_type {
+            Some("input_image") => "image_url",
+            Some("input_file") => "file_url",
+            _ => continue,
+        };
+        let Some(file_id) = object
+            .get(field)
+            .and_then(Value::as_str)
+            .and_then(files::parse_uri)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let file = files::get_owned(&state.pool, actor, &file_id).await?;
+        match delivery {
+            FileDelivery::Preserve => {}
+            FileDelivery::CapabilityUrl => {
+                object.insert(
+                    field.into(),
+                    Value::String(capability::file_url(&state.config, actor, &file_id)),
+                );
+            }
+            FileDelivery::PresignedUrl => {
+                let url = state
+                    .object_store
+                    .presigned_get(&file.storage_key, state.config.capability_ttl_seconds)
+                    .await
+                    .map_err(ApiError::ObjectStore)?
+                    .ok_or_else(|| {
+                        ApiError::BadRequest("presigned_url delivery requires S3_PUBLIC_URL".into())
+                    })?;
+                object.insert(field.into(), Value::String(url));
+            }
+            FileDelivery::Inline => {
+                let (_, bytes) =
+                    files::bytes(&state.pool, &state.object_store, actor, &file_id).await?;
+                if part_type == Some("input_image") {
+                    object.insert(
+                        "image_url".into(),
+                        Value::String(format!(
+                            "data:{};base64,{}",
+                            file.mime_type,
+                            STANDARD.encode(bytes)
+                        )),
+                    );
+                } else {
+                    object.remove("file_url");
+                    object.insert("file_data".into(), Value::String(STANDARD.encode(bytes)));
+                    object
+                        .entry("filename")
+                        .or_insert_with(|| Value::String(file.filename));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn project_replay_items(items: Vec<Value>, strip_top_level_ids: bool) -> Vec<Value> {
+    items
+        .into_iter()
+        .filter_map(|mut item| {
+            let object = item.as_object_mut()?;
+            if strip_top_level_ids {
+                object.remove("id");
+            }
+            Some(item)
+        })
+        .collect()
 }
 
 pub async fn create_turn(
@@ -382,5 +505,91 @@ mod tests {
     fn conversation_metadata_defaults_to_an_object() {
         let request: CreateConversation = serde_json::from_value(json!({})).unwrap();
         assert_eq!(request.metadata, json!({}));
+    }
+
+    #[test]
+    fn replay_preserves_multimodal_content_verbatim() {
+        let item = json!({
+            "type": "message",
+            "id": "msg_provider",
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,iVBORw0KGgo=",
+                    "detail": "high"
+                },
+                {
+                    "type": "input_file",
+                    "filename": "brief.pdf",
+                    "file_url": "threadmark://files/file_01k2example",
+                    "metadata": { "id": "nested-id-is-protocol-data" }
+                },
+                {
+                    "type": "input_audio",
+                    "audio_url": "https://media.example.test/sample.wav",
+                    "format": "wav"
+                }
+            ]
+        });
+
+        let replayed = project_replay_items(vec![item], true);
+
+        assert_eq!(
+            replayed,
+            vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,iVBORw0KGgo=",
+                        "detail": "high"
+                    },
+                    {
+                        "type": "input_file",
+                        "filename": "brief.pdf",
+                        "file_url": "threadmark://files/file_01k2example",
+                        "metadata": { "id": "nested-id-is-protocol-data" }
+                    },
+                    {
+                        "type": "input_audio",
+                        "audio_url": "https://media.example.test/sample.wav",
+                        "format": "wav"
+                    }
+                ]
+            })]
+        );
+    }
+
+    #[test]
+    fn replay_can_preserve_multimodal_item_ids() {
+        let item = json!({
+            "type": "message",
+            "id": "msg_provider",
+            "role": "user",
+            "content": [{
+                "type": "input_image",
+                "image_url": "https://media.example.test/image.png"
+            }]
+        });
+
+        assert_eq!(project_replay_items(vec![item.clone()], false), vec![item]);
+    }
+
+    #[test]
+    fn finds_threadmark_file_references_in_opaque_items() {
+        let value = json!({
+            "content": [
+                { "image_url": "threadmark://files/file_image" },
+                { "file_url": "threadmark://files/file_document" },
+                { "nested": ["threadmark://files/file_image"] },
+                { "external": "https://example.test/file" }
+            ]
+        });
+        assert_eq!(
+            referenced_file_ids(&value),
+            vec!["file_document".to_owned(), "file_image".to_owned()]
+        );
     }
 }

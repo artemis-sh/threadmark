@@ -71,6 +71,18 @@ pub struct ReplayRequest {
     pub through_seq: Option<i64>,
     #[serde(default = "default_true")]
     pub strip_top_level_ids: bool,
+    #[serde(default)]
+    pub file_delivery: FileDelivery,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileDelivery {
+    #[default]
+    Preserve,
+    CapabilityUrl,
+    PresignedUrl,
+    Inline,
 }
 
 pub(crate) fn default_true() -> bool {
@@ -136,4 +148,47 @@ pub struct CreateContinuation {
 #[derive(Debug, Deserialize)]
 pub struct ContinuationQuery {
     pub agent_ref: String,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct FileRecord {
+    pub id: String,
+    pub tenant_id: String,
+    pub owner_ref: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub size: i64,
+    #[serde(skip)]
+    pub storage_key: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl FileRecord {
+    pub fn uri(&self) -> String {
+        format!("threadmark://files/{}", self.id)
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct FileResponse {
+    pub id: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub size: i64,
+    pub uri: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<FileRecord> for FileResponse {
+    fn from(file: FileRecord) -> Self {
+        let uri = file.uri();
+        Self {
+            id: file.id.clone(),
+            filename: file.filename,
+            mime_type: file.mime_type,
+            size: file.size,
+            uri,
+            created_at: file.created_at,
+        }
+    }
 }
