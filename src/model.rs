@@ -28,6 +28,17 @@ pub struct CreateConversation {
     pub metadata: Value,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ListConversationsQuery {
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateConversation {
+    pub title: Option<String>,
+    pub metadata: Option<Value>,
+}
+
 fn empty_object() -> Value {
     serde_json::json!({})
 }
@@ -123,6 +134,16 @@ pub struct UpdateTurn {
     pub usage: Option<Value>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct TruncateConversation {
+    pub item_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegenerateResult {
+    pub turn_id: Option<String>,
+}
+
 #[derive(Debug, Serialize, FromRow)]
 pub struct Continuation {
     pub id: String,
@@ -177,6 +198,34 @@ pub struct FileResponse {
     pub size: i64,
     pub uri: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadDelivery {
+    Redirect,
+    Proxy,
+}
+
+impl DownloadDelivery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Redirect => "redirect",
+            Self::Proxy => "proxy",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateDownload {
+    pub delivery: DownloadDelivery,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DownloadGrant {
+    pub url: String,
+    pub delivery: String,
+    pub expires_at: DateTime<Utc>,
 }
 
 impl From<FileRecord> for FileResponse {

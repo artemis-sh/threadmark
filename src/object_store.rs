@@ -37,6 +37,10 @@ impl ObjectStore {
         Ok(())
     }
 
+    pub fn supports_public_urls(&self) -> bool {
+        self.public_client.is_some()
+    }
+
     pub async fn put(&self, key: &str, bytes: Vec<u8>, content_type: &str) -> anyhow::Result<()> {
         self.client
             .put_object()
@@ -68,6 +72,18 @@ impl ObjectStore {
             .to_vec())
     }
 
+    pub async fn get_stream(&self, key: &str) -> anyhow::Result<ByteStream> {
+        Ok(self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .context("get S3 object")?
+            .body)
+    }
+
     pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
         self.client
             .delete_object()
@@ -83,16 +99,22 @@ impl ObjectStore {
         &self,
         key: &str,
         ttl_seconds: u64,
+        content_type: Option<&str>,
+        content_disposition: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
         let Some(client) = &self.public_client else {
             return Ok(None);
         };
         let expires = PresigningConfig::expires_in(Duration::from_secs(ttl_seconds))
             .context("invalid presigned URL lifetime")?;
-        let request = client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
+        let mut request = client.get_object().bucket(&self.bucket).key(key);
+        if let Some(content_type) = content_type {
+            request = request.response_content_type(content_type);
+        }
+        if let Some(content_disposition) = content_disposition {
+            request = request.response_content_disposition(content_disposition);
+        }
+        let request = request
             .presigned(expires)
             .await
             .context("presign S3 object")?;

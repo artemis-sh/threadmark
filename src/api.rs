@@ -3,8 +3,8 @@ use axum::{
     body::Body,
     extract::{DefaultBodyLimit, FromRequestParts, Multipart, Path, Query, State},
     http::{HeaderValue, StatusCode, header, header::HeaderMap, request::Parts},
-    response::Response,
-    routing::{get, patch, post},
+    response::{IntoResponse, Response},
+    routing::{get, post},
 };
 use sqlx::PgPool;
 use tower_http::trace::TraceLayer;
@@ -16,8 +16,10 @@ use crate::{
     files,
     model::{
         Actor, AppendItems, AppendResult, Continuation, ContinuationQuery, Conversation,
-        CreateContinuation, CreateConversation, CreateTurn, FileResponse, Item, ListItemsQuery,
-        ReplayRequest, ReplayResult, Turn, UpdateTurn,
+        CreateContinuation, CreateConversation, CreateDownload, CreateTurn, DownloadDelivery,
+        DownloadGrant, FileResponse, Item, ListConversationsQuery, ListItemsQuery,
+        RegenerateResult, ReplayRequest, ReplayResult, TruncateConversation, Turn,
+        UpdateConversation, UpdateTurn,
     },
     object_store::ObjectStore,
     store,
@@ -33,15 +35,35 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/v1/conversations", post(create_conversation))
-        .route("/v1/conversations/{id}", get(get_conversation))
+        .route(
+            "/v1/conversations",
+            get(list_conversations).post(create_conversation),
+        )
+        .route(
+            "/v1/conversations/{id}",
+            get(get_conversation)
+                .patch(update_conversation)
+                .delete(delete_conversation),
+        )
         .route(
             "/v1/conversations/{id}/items",
             get(list_items).post(append_items),
         )
         .route("/v1/conversations/{id}/replay", post(replay))
-        .route("/v1/conversations/{id}/turns", post(create_turn))
-        .route("/v1/turns/{id}", patch(update_turn))
+        .route(
+            "/v1/conversations/{id}/turns",
+            get(list_turns).post(create_turn),
+        )
+        .route("/v1/conversations/{id}/active-turn", get(get_active_turn))
+        .route("/v1/turns/{id}", get(get_turn).patch(update_turn))
+        .route(
+            "/v1/conversations/{id}/truncate",
+            post(truncate_conversation),
+        )
+        .route(
+            "/v1/conversations/{id}/regenerate",
+            post(regenerate_conversation),
+        )
         .route(
             "/v1/conversations/{id}/continuations",
             post(create_continuation),
@@ -49,7 +71,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/continuations/{response_id}", get(get_continuation))
         .route("/v1/files", post(upload_file))
         .route("/v1/files/{id}", get(get_file).delete(delete_file))
-        .route("/v1/capabilities/files/{id}", get(download_capability))
+        .route("/v1/files/{id}/content", get(get_file_content))
+        .route("/v1/files/{id}/downloads", post(create_file_download))
+        .route("/v1/downloads/files/{id}", get(download_file))
         // Open Responses permits ~32 MiB base64 file parts. Leave room for
         // the surrounding item and batch JSON while still bounding memory.
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
@@ -102,6 +126,16 @@ async fn create_conversation(
     ))
 }
 
+async fn list_conversations(
+    State(state): State<AppState>,
+    actor: Actor,
+    Query(query): Query<ListConversationsQuery>,
+) -> ApiResult<Json<Vec<Conversation>>> {
+    Ok(Json(
+        store::list_conversations(&state.pool, &actor, query.limit.unwrap_or(200)).await?,
+    ))
+}
+
 async fn get_conversation(
     State(state): State<AppState>,
     actor: Actor,
@@ -110,6 +144,26 @@ async fn get_conversation(
     Ok(Json(
         store::get_conversation(&state.pool, &actor, &id).await?,
     ))
+}
+
+async fn update_conversation(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateConversation>,
+) -> ApiResult<Json<Conversation>> {
+    Ok(Json(
+        store::update_conversation(&state.pool, &actor, &id, request).await?,
+    ))
+}
+
+async fn delete_conversation(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    store::delete_conversation(&state.pool, &actor, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_items(
@@ -162,6 +216,30 @@ async fn create_turn(
     ))
 }
 
+async fn list_turns(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<Turn>>> {
+    Ok(Json(store::list_turns(&state.pool, &actor, &id).await?))
+}
+
+async fn get_active_turn(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Option<Turn>>> {
+    Ok(Json(store::active_turn(&state.pool, &actor, &id).await?))
+}
+
+async fn get_turn(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Turn>> {
+    Ok(Json(store::get_turn(&state.pool, &actor, &id).await?))
+}
+
 async fn update_turn(
     State(state): State<AppState>,
     actor: Actor,
@@ -194,6 +272,26 @@ async fn get_continuation(
     Ok(Json(
         store::get_continuation(&state.pool, &actor, &response_id, &query.agent_ref).await?,
     ))
+}
+
+async fn truncate_conversation(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(id): Path<String>,
+    Json(request): Json<TruncateConversation>,
+) -> ApiResult<StatusCode> {
+    store::truncate_conversation(&state.pool, &actor, &id, &request.item_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn regenerate_conversation(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(id): Path<String>,
+) -> ApiResult<Json<RegenerateResult>> {
+    Ok(Json(RegenerateResult {
+        turn_id: store::regenerate_conversation(&state.pool, &actor, &id).await?,
+    }))
 }
 
 async fn upload_file(
@@ -242,6 +340,15 @@ async fn get_file(
     ))
 }
 
+async fn get_file_content(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    let file = files::get_owned(&state.pool, &actor, &id).await?;
+    stream_file(&state, file).await
+}
+
 async fn delete_file(
     State(state): State<AppState>,
     actor: Actor,
@@ -252,32 +359,83 @@ async fn delete_file(
 }
 
 #[derive(serde::Deserialize)]
-struct CapabilityQuery {
+struct DownloadQuery {
     tenant: String,
     owner: String,
+    delivery: DownloadDelivery,
     expires: u64,
     signature: String,
 }
 
-async fn download_capability(
+async fn create_file_download(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(id): Path<String>,
+    Json(request): Json<CreateDownload>,
+) -> ApiResult<Json<DownloadGrant>> {
+    files::get_owned(&state.pool, &actor, &id).await?;
+    if request.delivery == DownloadDelivery::Redirect && !state.object_store.supports_public_urls()
+    {
+        return Err(ApiError::BadRequest(
+            "redirect delivery requires S3_PUBLIC_URL".into(),
+        ));
+    }
+    Ok(Json(capability::file_url(
+        &state.config,
+        &actor,
+        &id,
+        request.delivery,
+    )))
+}
+
+async fn download_file(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(query): Query<CapabilityQuery>,
+    Query(query): Query<DownloadQuery>,
 ) -> ApiResult<Response> {
     let actor = Actor {
         tenant_id: query.tenant,
         principal_id: query.owner,
     };
-    if !capability::verify_file(&state.config, &actor, &id, query.expires, &query.signature) {
+    if !capability::verify_file(
+        &state.config,
+        &actor,
+        &id,
+        query.delivery,
+        query.expires,
+        &query.signature,
+    ) {
         return Err(ApiError::NotFound("File capability not found.".into()));
     }
-    let (file, bytes) = files::bytes(&state.pool, &state.object_store, &actor, &id).await?;
-    let disposition = format!(
-        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
-        ascii_filename(&file.filename),
-        percent_encode_filename(&file.filename)
-    );
-    let mut response = Response::new(Body::from(bytes));
+    let file = files::get_owned(&state.pool, &actor, &id).await?;
+    match query.delivery {
+        DownloadDelivery::Redirect => {
+            let url = state
+                .object_store
+                .presigned_get(
+                    &file.storage_key,
+                    state.config.capability_ttl_seconds,
+                    Some(&file.mime_type),
+                    Some(&content_disposition(&file.filename)),
+                )
+                .await
+                .map_err(ApiError::ObjectStore)?
+                .ok_or_else(|| ApiError::BadRequest("S3_PUBLIC_URL is not configured".into()))?;
+            Ok(axum::response::Redirect::temporary(&url).into_response())
+        }
+        DownloadDelivery::Proxy => stream_file(&state, file).await,
+    }
+}
+
+async fn stream_file(state: &AppState, file: crate::model::FileRecord) -> ApiResult<Response> {
+    let stream = state
+        .object_store
+        .get_stream(&file.storage_key)
+        .await
+        .map_err(ApiError::ObjectStore)?;
+    let body = Body::from_stream(tokio_util::io::ReaderStream::new(stream.into_async_read()));
+    let disposition = content_disposition(&file.filename);
+    let mut response = Response::new(body);
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_TYPE,
@@ -302,6 +460,14 @@ async fn download_capability(
         HeaderValue::from_static("nosniff"),
     );
     Ok(response)
+}
+
+fn content_disposition(filename: &str) -> String {
+    format!(
+        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+        ascii_filename(filename),
+        percent_encode_filename(filename)
+    )
 }
 
 fn ascii_filename(filename: &str) -> String {

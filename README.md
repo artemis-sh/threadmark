@@ -52,7 +52,7 @@ can resolve it according to the receiving agent's delivery policy:
 | `file_delivery` | Projection |
 | --- | --- |
 | `preserve` | Keep the canonical `threadmark://` URI (default) |
-| `capability_url` | Mint an expiring, signed Threadmark HTTPS download URL |
+| `capability_url` | Mint an expiring Threadmark URL that streams from private S3 |
 | `presigned_url` | Mint a direct S3 URL using `S3_PUBLIC_URL` |
 | `inline` | Read S3 bytes and emit `file_data` or an image data URL |
 
@@ -60,6 +60,13 @@ Consumers must not send the `threadmark://` URI directly to a model provider
 that only accepts HTTP(S) or data URLs. Append rejects Threadmark file URIs that
 do not resolve to a file owned by the conversation principal. A file referenced
 by any conversation cannot be deleted.
+
+For direct file delivery, an authenticated caller creates a signed grant with
+`POST /v1/files/{id}/downloads`. A `redirect` grant keeps Threadmark as the
+stable authorization origin but responds with a temporary redirect to S3; a
+`proxy` grant streams the private S3 object through Threadmark with bounded
+memory for clients that cannot follow redirects. The selected mode is covered
+by the signature and cannot be changed by the recipient.
 
 ## Status
 
@@ -75,6 +82,12 @@ This is an experiment and its API is not stable. The current slice establishes:
 Editing, branching, retention, event delivery, production authentication, and
 fine-grained capabilities are intentionally deferred until the core contract is
 validated by a second client.
+
+Parley now serves as that second client. Threadmark additionally exposes
+owner-scoped conversation listing and updates, turn reads, destructive linear
+edit/regenerate operations, and authenticated file content reads for the Parley
+server adapter. The trusted-header identity boundary remains experimental and
+requires network isolation until service authentication is implemented.
 
 ## Run
 
@@ -217,7 +230,8 @@ GET /v1/continuations/resp_abc?agent_ref=research-agent%2Fprod
 | `POST` | `/v1/files` | Upload a tenant-owned S3-backed file |
 | `GET` | `/v1/files/{id}` | Read owned file metadata |
 | `DELETE` | `/v1/files/{id}` | Delete an unreferenced owned file |
-| `GET` | `/v1/capabilities/files/{id}` | Download through a signed capability |
+| `POST` | `/v1/files/{id}/downloads` | Mint a redirect or proxy download grant |
+| `GET` | `/v1/downloads/files/{id}` | Redeem a signed stable Threadmark URL |
 
 ## Design notes
 

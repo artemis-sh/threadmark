@@ -11,7 +11,7 @@ use crate::{
     model::{
         Actor, AppendItems, AppendResult, Continuation, Conversation, CreateContinuation,
         CreateConversation, CreateTurn, FileDelivery, Item, ReplayRequest, ReplayResult, Turn,
-        UpdateTurn,
+        UpdateConversation, UpdateTurn,
     },
 };
 
@@ -44,6 +44,22 @@ pub async fn create_conversation(
     .await?)
 }
 
+pub async fn list_conversations(
+    pool: &PgPool,
+    actor: &Actor,
+    limit: i64,
+) -> ApiResult<Vec<Conversation>> {
+    Ok(sqlx::query_as::<_, Conversation>(
+        "SELECT * FROM conversations WHERE tenant_id = $1 AND owner_ref = $2
+         ORDER BY updated_at DESC LIMIT $3",
+    )
+    .bind(&actor.tenant_id)
+    .bind(&actor.principal_id)
+    .bind(limit.clamp(1, 1000))
+    .fetch_all(pool)
+    .await?)
+}
+
 pub async fn get_conversation(pool: &PgPool, actor: &Actor, id: &str) -> ApiResult<Conversation> {
     sqlx::query_as::<_, Conversation>(
         "SELECT * FROM conversations WHERE id = $1 AND tenant_id = $2 AND owner_ref = $3",
@@ -54,6 +70,62 @@ pub async fn get_conversation(pool: &PgPool, actor: &Actor, id: &str) -> ApiResu
     .fetch_optional(pool)
     .await?
     .ok_or_else(|| ApiError::NotFound("Conversation not found.".into()))
+}
+
+pub async fn update_conversation(
+    pool: &PgPool,
+    actor: &Actor,
+    id: &str,
+    request: UpdateConversation,
+) -> ApiResult<Conversation> {
+    if request.title.is_none() && request.metadata.is_none() {
+        return Err(ApiError::BadRequest(
+            "No conversation changes supplied.".into(),
+        ));
+    }
+    if let Some(title) = &request.title
+        && (title.trim().is_empty() || title.len() > 200)
+    {
+        return Err(ApiError::BadRequest(
+            "title must contain 1 to 200 characters".into(),
+        ));
+    }
+    if let Some(metadata) = &request.metadata
+        && !metadata.is_object()
+    {
+        return Err(ApiError::BadRequest(
+            "metadata must be a JSON object".into(),
+        ));
+    }
+    sqlx::query_as::<_, Conversation>(
+        "UPDATE conversations SET title = COALESCE($1, title),
+            metadata = CASE WHEN $2::jsonb IS NULL THEN metadata ELSE metadata || $2 END,
+            updated_at = now()
+         WHERE id = $3 AND tenant_id = $4 AND owner_ref = $5 RETURNING *",
+    )
+    .bind(request.title.map(|title| title.trim().to_owned()))
+    .bind(request.metadata)
+    .bind(id)
+    .bind(&actor.tenant_id)
+    .bind(&actor.principal_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Conversation not found.".into()))
+}
+
+pub async fn delete_conversation(pool: &PgPool, actor: &Actor, id: &str) -> ApiResult<()> {
+    let result = sqlx::query(
+        "DELETE FROM conversations WHERE id = $1 AND tenant_id = $2 AND owner_ref = $3",
+    )
+    .bind(id)
+    .bind(&actor.tenant_id)
+    .bind(&actor.principal_id)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("Conversation not found.".into()));
+    }
+    Ok(())
 }
 
 pub async fn list_items(
@@ -309,13 +381,26 @@ async fn hydrate_file_references(
             FileDelivery::CapabilityUrl => {
                 object.insert(
                     field.into(),
-                    Value::String(capability::file_url(&state.config, actor, &file_id)),
+                    Value::String(
+                        capability::file_url(
+                            &state.config,
+                            actor,
+                            &file_id,
+                            crate::model::DownloadDelivery::Proxy,
+                        )
+                        .url,
+                    ),
                 );
             }
             FileDelivery::PresignedUrl => {
                 let url = state
                     .object_store
-                    .presigned_get(&file.storage_key, state.config.capability_ttl_seconds)
+                    .presigned_get(
+                        &file.storage_key,
+                        state.config.capability_ttl_seconds,
+                        Some(&file.mime_type),
+                        None,
+                    )
                     .await
                     .map_err(ApiError::ObjectStore)?
                     .ok_or_else(|| {
@@ -385,6 +470,119 @@ pub async fn create_turn(
     .bind(request.idempotency_key)
     .fetch_one(pool)
     .await?)
+}
+
+pub async fn list_turns(
+    pool: &PgPool,
+    actor: &Actor,
+    conversation_id: &str,
+) -> ApiResult<Vec<Turn>> {
+    get_conversation(pool, actor, conversation_id).await?;
+    Ok(sqlx::query_as::<_, Turn>(
+        "SELECT * FROM turns WHERE conversation_id = $1 ORDER BY created_at ASC",
+    )
+    .bind(conversation_id)
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn active_turn(
+    pool: &PgPool,
+    actor: &Actor,
+    conversation_id: &str,
+) -> ApiResult<Option<Turn>> {
+    get_conversation(pool, actor, conversation_id).await?;
+    Ok(sqlx::query_as::<_, Turn>(
+        "SELECT * FROM turns WHERE conversation_id = $1
+         AND status IN ('pending', 'streaming') ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(conversation_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+pub async fn get_turn(pool: &PgPool, actor: &Actor, id: &str) -> ApiResult<Turn> {
+    sqlx::query_as::<_, Turn>(
+        "SELECT t.* FROM turns t JOIN conversations c ON c.id = t.conversation_id
+         WHERE t.id = $1 AND c.tenant_id = $2 AND c.owner_ref = $3",
+    )
+    .bind(id)
+    .bind(&actor.tenant_id)
+    .bind(&actor.principal_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Turn not found.".into()))
+}
+
+pub async fn truncate_conversation(
+    pool: &PgPool,
+    actor: &Actor,
+    conversation_id: &str,
+    item_id: &str,
+) -> ApiResult<()> {
+    let mut tx = pool.begin().await?;
+    lock_conversation(&mut tx, actor, conversation_id).await?;
+    let seq = sqlx::query_scalar::<_, i64>(
+        "SELECT seq FROM conversation_items WHERE id = $1 AND conversation_id = $2",
+    )
+    .bind(item_id)
+    .bind(conversation_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Item not found in conversation.".into()))?;
+    sqlx::query("DELETE FROM conversation_items WHERE conversation_id = $1 AND seq >= $2")
+        .bind(conversation_id)
+        .bind(seq)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM append_batches WHERE conversation_id = $1 AND last_seq >= $2")
+        .bind(conversation_id)
+        .bind(seq)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM continuations WHERE conversation_id = $1 AND through_seq >= $2")
+        .bind(conversation_id)
+        .bind(seq)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE conversations SET next_seq = $2, updated_at = now() WHERE id = $1")
+        .bind(conversation_id)
+        .bind(seq)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn regenerate_conversation(
+    pool: &PgPool,
+    actor: &Actor,
+    conversation_id: &str,
+) -> ApiResult<Option<String>> {
+    let mut tx = pool.begin().await?;
+    lock_conversation(&mut tx, actor, conversation_id).await?;
+    let turn_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM turns WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(conversation_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(turn_id) = &turn_id {
+        sqlx::query("DELETE FROM conversation_items WHERE turn_id = $1 AND source = 'agent'")
+            .bind(turn_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM continuations WHERE conversation_id = $1")
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE conversations SET updated_at = now() WHERE id = $1")
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(turn_id)
 }
 
 pub async fn update_turn(

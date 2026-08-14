@@ -6,7 +6,9 @@ COPY migrations ./migrations
 RUN cargo build --locked --release
 
 FROM debian:bookworm-slim
-RUN useradd --system --uid 10001 threadmark
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 threadmark
 COPY --from=build /src/target/release/threadmark /usr/local/bin/threadmark
 USER threadmark
 EXPOSE 8090
