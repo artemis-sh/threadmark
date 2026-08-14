@@ -131,6 +131,15 @@ experiment directly to untrusted traffic. A production deployment should
 validate signed service credentials or short-lived capabilities and derive
 these values from claims rather than accepting arbitrary headers.
 
+Set `AUTH_MODE=trusted_headers` only in an isolated development build compiled
+with `--features trusted-headers`; the default binary does not contain that
+mode. Production uses
+`AUTH_MODE=jwt` with `AUTH_ISSUER`, `AUTH_AUDIENCE`, and an HTTPS
+`AUTH_JWKS_URL`. JWT mode accepts Ed25519 `at+jwt` owner-session tokens and
+derives tenant, principal, and endpoint permissions exclusively from verified
+claims. Delegated-agent tokens remain rejected until their resource-bound write
+invariants are implemented.
+
 An agent called by Parley can receive a short-lived token scoped to the same
 tenant, principal, conversation, turn, and agent deployment. That authorization
 layer is deliberately separate from the ledger model.

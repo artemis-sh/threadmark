@@ -19,6 +19,18 @@ pub struct Inner {
     pub s3_access_key_id: String,
     pub s3_secret_access_key: String,
     pub s3_force_path_style: bool,
+    pub auth_mode: AuthMode,
+    pub auth_issuer: Option<String>,
+    pub auth_audience: Option<String>,
+    pub auth_jwks_url: Option<String>,
+    pub auth_max_owner_token_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthMode {
+    Jwt,
+    #[cfg(feature = "trusted-headers")]
+    TrustedHeaders,
 }
 
 impl std::ops::Deref for Config {
@@ -53,6 +65,43 @@ impl Config {
             .and_then(|value| value.checked_mul(1024 * 1024))
             .context("FILE_MAX_MB is too large")?;
 
+        let auth_mode = match required("AUTH_MODE")?.as_str() {
+            "jwt" => AuthMode::Jwt,
+            #[cfg(feature = "trusted-headers")]
+            "trusted_headers" => AuthMode::TrustedHeaders,
+            _ => anyhow::bail!("AUTH_MODE is not supported by this build"),
+        };
+        let auth_setting = |name: &str| -> anyhow::Result<Option<String>> {
+            match auth_mode {
+                AuthMode::Jwt => required(name).map(Some),
+                #[cfg(feature = "trusted-headers")]
+                AuthMode::TrustedHeaders => Ok(None),
+            }
+        };
+        let auth_issuer = auth_setting("AUTH_ISSUER")?;
+        let auth_audience = auth_setting("AUTH_AUDIENCE")?;
+        let auth_jwks_url = auth_setting("AUTH_JWKS_URL")?;
+        if let (Some(issuer), Some(jwks_url)) = (&auth_issuer, &auth_jwks_url) {
+            let issuer = url::Url::parse(issuer).context("AUTH_ISSUER must be an absolute URL")?;
+            let jwks_url =
+                url::Url::parse(jwks_url).context("AUTH_JWKS_URL must be an absolute URL")?;
+            ensure!(issuer.scheme() == "https", "AUTH_ISSUER must use HTTPS");
+            ensure!(jwks_url.scheme() == "https", "AUTH_JWKS_URL must use HTTPS");
+            ensure!(
+                issuer.origin() == jwks_url.origin(),
+                "AUTH_JWKS_URL must have the same origin as AUTH_ISSUER"
+            );
+        }
+        let auth_max_owner_token_seconds = parse("AUTH_MAX_OWNER_TOKEN_SECONDS", "300")?;
+        ensure!(
+            auth_max_owner_token_seconds > 0,
+            "AUTH_MAX_OWNER_TOKEN_SECONDS must be greater than zero"
+        );
+        #[cfg(feature = "trusted-headers")]
+        if auth_mode == AuthMode::TrustedHeaders {
+            tracing::warn!("trusted-header authentication is enabled; do not expose this service");
+        }
+
         Ok(Self(Arc::new(Inner {
             database_url: required("DATABASE_URL")?,
             listen_addr: std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8090".into()),
@@ -72,6 +121,11 @@ impl Config {
                 .unwrap_or_else(|_| "true".into())
                 .parse()
                 .context("S3_FORCE_PATH_STYLE must be true or false")?,
+            auth_mode,
+            auth_issuer,
+            auth_audience,
+            auth_jwks_url,
+            auth_max_owner_token_seconds,
         })))
     }
 }

@@ -1,4 +1,5 @@
 mod api;
+mod auth;
 mod capability;
 mod config;
 mod error;
@@ -23,6 +24,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = config::Config::from_env()?;
+    let auth = auth::Authenticator::from_config(&config)
+        .await
+        .context("initialize authentication")?;
     let pool = PgPoolOptions::new()
         .max_connections(20)
         .connect(&config.database_url)
@@ -47,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
             pool,
             object_store,
             config,
+            auth,
         }),
     )
     .with_graceful_shutdown(shutdown_signal())
