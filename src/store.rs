@@ -1,5 +1,7 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
+use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::{
@@ -10,10 +12,36 @@ use crate::{
     ids::new_id,
     model::{
         Actor, AppendItems, AppendResult, Continuation, Conversation, CreateContinuation,
-        CreateConversation, CreateTurn, FileDelivery, Item, ReplayRequest, ReplayResult, Turn,
-        UpdateConversation, UpdateTurn,
+        CreateConversation, CreateTurn, FileDelivery, Item, ReplayRequest, ReplayResult, StartTurn,
+        StartTurnResult, Turn, UpdateConversation, UpdateTurn,
     },
 };
+
+#[derive(Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum TurnStartDigest<'a> {
+    Existing {
+        operation: &'static str,
+        version: i16,
+        conversation_id: &'a str,
+        agent_ref: &'a str,
+        items: &'a [Value],
+    },
+    Create {
+        operation: &'static str,
+        version: i16,
+        conversation: &'a CreateConversation,
+        agent_ref: &'a str,
+        items: &'a [Value],
+    },
+}
+
+fn coded_conflict(code: &'static str, message: &str) -> ApiError {
+    ApiError::CodedConflict {
+        code,
+        message: message.into(),
+    }
+}
 
 pub async fn create_conversation(
     pool: &PgPool,
@@ -162,6 +190,359 @@ async fn lock_conversation<'a>(
     .fetch_optional(&mut **tx)
     .await?
     .ok_or_else(|| ApiError::NotFound("Conversation not found.".into()))
+}
+
+pub async fn start_turn(
+    pool: &PgPool,
+    auth: &crate::auth::AuthContext,
+    mut request: StartTurn,
+) -> ApiResult<StartTurnResult> {
+    request.idempotency_key = request.idempotency_key.trim().to_owned();
+    request.agent_ref = request.agent_ref.trim().to_owned();
+    if request.idempotency_key.is_empty() || request.idempotency_key.chars().count() > 200 {
+        return Err(ApiError::BadRequest(
+            "idempotency_key must contain 1 to 200 characters".into(),
+        ));
+    }
+    if request.agent_ref.is_empty() || request.agent_ref.chars().count() > 200 {
+        return Err(ApiError::BadRequest(
+            "agent_ref must contain 1 to 200 characters".into(),
+        ));
+    }
+    if request.conversation_id.is_some() == request.conversation.is_some() {
+        return Err(ApiError::BadRequest(
+            "exactly one of conversation_id and conversation is required".into(),
+        ));
+    }
+    if request.items.is_empty() || request.items.len() > 100 {
+        return Err(ApiError::BadRequest(
+            "items must contain between 1 and 100 entries".into(),
+        ));
+    }
+    if request.items.iter().any(|item| !item.is_object()) {
+        return Err(ApiError::BadRequest(
+            "each item must be a JSON object".into(),
+        ));
+    }
+    if let Some(conversation) = &mut request.conversation {
+        if !conversation.metadata.is_object() {
+            return Err(ApiError::BadRequest(
+                "metadata must be a JSON object".into(),
+            ));
+        }
+        let title = conversation
+            .title
+            .as_deref()
+            .unwrap_or("New conversation")
+            .trim();
+        if title.is_empty() || title.chars().count() > 200 {
+            return Err(ApiError::BadRequest(
+                "title must contain 1 to 200 characters".into(),
+            ));
+        }
+        conversation.title = Some(title.to_owned());
+    }
+
+    let digest_input = match (
+        request.conversation_id.as_deref(),
+        request.conversation.as_ref(),
+    ) {
+        (Some(conversation_id), None) => TurnStartDigest::Existing {
+            operation: "turn_start",
+            version: 1,
+            conversation_id,
+            agent_ref: &request.agent_ref,
+            items: &request.items,
+        },
+        (None, Some(conversation)) => TurnStartDigest::Create {
+            operation: "turn_start",
+            version: 1,
+            conversation,
+            agent_ref: &request.agent_ref,
+            items: &request.items,
+        },
+        _ => unreachable!("conversation mode validated"),
+    };
+    let request_digest = Sha256::digest(
+        serde_json_canonicalizer::to_vec(&digest_input)
+            .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?,
+    )
+    .to_vec();
+    let lock_key = turn_start_lock_key(
+        &auth.tenant_id,
+        &auth.principal_id,
+        &auth.client_id,
+        &request.idempotency_key,
+    );
+
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(lock_key)
+        .execute(&mut *tx)
+        .await?;
+
+    if let Some((turn_start_id, stored_digest, conversation_id, turn_id, first_seq, last_seq)) =
+        sqlx::query_as::<_, (String, Vec<u8>, String, String, i64, i64)>(
+            "SELECT id, request_digest, conversation_id, turn_id, first_seq, last_seq
+             FROM turn_starts
+             WHERE tenant_id = $1 AND owner_ref = $2 AND client_id = $3
+               AND idempotency_key = $4",
+        )
+        .bind(&auth.tenant_id)
+        .bind(&auth.principal_id)
+        .bind(&auth.client_id)
+        .bind(&request.idempotency_key)
+        .fetch_optional(&mut *tx)
+        .await?
+    {
+        if stored_digest != request_digest {
+            if let Some(conversation_id) = &request.conversation_id {
+                let owned = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM conversations
+                     WHERE id = $1 AND tenant_id = $2 AND owner_ref = $3)",
+                )
+                .bind(conversation_id)
+                .bind(&auth.tenant_id)
+                .bind(&auth.principal_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if !owned {
+                    return Err(ApiError::NotFound("Conversation not found.".into()));
+                }
+            }
+            return Err(coded_conflict(
+                "idempotency_key_reused",
+                "idempotency_key was already used for a different request",
+            ));
+        }
+        let conversation_exists = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM conversations
+             WHERE id = $1 AND tenant_id = $2 AND owner_ref = $3 FOR UPDATE",
+        )
+        .bind(&conversation_id)
+        .bind(&auth.tenant_id)
+        .bind(&auth.principal_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        let item_ids = sqlx::query_scalar::<_, String>(
+            "SELECT tsi.item_id
+             FROM turn_start_items tsi
+             JOIN conversation_items i ON i.id = tsi.item_id
+             WHERE tsi.turn_start_id = $1 AND i.conversation_id = $2
+               AND i.turn_id = $3 AND i.seq = tsi.seq
+             ORDER BY tsi.ordinal",
+        )
+        .bind(&turn_start_id)
+        .bind(&conversation_id)
+        .bind(&turn_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if !conversation_exists || item_ids.len() != (last_seq - first_seq + 1) as usize {
+            return Err(coded_conflict(
+                "idempotency_result_deleted",
+                "the original turn start result is no longer available",
+            ));
+        }
+        tx.commit().await?;
+        return Ok(StartTurnResult {
+            conversation_id,
+            turn_id,
+            item_ids,
+            first_seq,
+            last_seq,
+            replayed: true,
+        });
+    }
+
+    let conversation = if let Some(conversation_id) = &request.conversation_id {
+        lock_conversation(&mut tx, auth, conversation_id).await?
+    } else {
+        let conversation = request
+            .conversation
+            .as_ref()
+            .expect("validated conversation");
+        sqlx::query_as::<_, Conversation>(
+            "INSERT INTO conversations (id, tenant_id, owner_ref, title, metadata)
+             VALUES ($1, $2, $3, $4, $5) RETURNING *",
+        )
+        .bind(new_id("conv"))
+        .bind(&auth.tenant_id)
+        .bind(&auth.principal_id)
+        .bind(conversation.title.as_deref().expect("normalized title"))
+        .bind(&conversation.metadata)
+        .fetch_one(&mut *tx)
+        .await?
+    };
+
+    let active_turn_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM turns WHERE conversation_id = $1
+         AND status IN ('pending', 'streaming'))",
+    )
+    .bind(&conversation.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if active_turn_exists {
+        return Err(coded_conflict(
+            "active_turn_exists",
+            "conversation already has an active turn",
+        ));
+    }
+
+    let mut file_ids = request
+        .items
+        .iter()
+        .flat_map(referenced_file_ids)
+        .collect::<Vec<_>>();
+    file_ids.sort();
+    file_ids.dedup();
+    for file_id in file_ids {
+        let exists = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM files
+             WHERE id = $1 AND tenant_id = $2 AND owner_ref = $3 FOR KEY SHARE",
+        )
+        .bind(file_id)
+        .bind(&auth.tenant_id)
+        .bind(&auth.principal_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        if !exists {
+            return Err(ApiError::NotFound("File not found.".into()));
+        }
+    }
+
+    let turn_id = new_id("turn");
+    let turn_insert = sqlx::query(
+        "INSERT INTO turns (id, conversation_id, agent_ref, idempotency_key)
+         VALUES ($1, $2, $3, NULL)",
+    )
+    .bind(&turn_id)
+    .bind(&conversation.id)
+    .bind(&request.agent_ref)
+    .execute(&mut *tx)
+    .await;
+    if let Err(error) = turn_insert {
+        if error
+            .as_database_error()
+            .and_then(|error| error.constraint())
+            == Some("turns_one_active_per_conversation_idx")
+        {
+            return Err(coded_conflict(
+                "active_turn_exists",
+                "conversation already has an active turn",
+            ));
+        }
+        return Err(error.into());
+    }
+
+    let item_count = i64::try_from(request.items.len())
+        .map_err(|_| coded_conflict("sequence_space_exhausted", "sequence space exhausted"))?;
+    let next_seq = conversation
+        .next_seq
+        .checked_add(item_count)
+        .ok_or_else(|| coded_conflict("sequence_space_exhausted", "sequence space exhausted"))?;
+    let first_seq = conversation.next_seq;
+    let last_seq = next_seq - 1;
+    let mut item_ids = Vec::with_capacity(request.items.len());
+    for (offset, payload) in request.items.into_iter().enumerate() {
+        let item_id = new_id("item");
+        sqlx::query(
+            "INSERT INTO conversation_items
+             (id, conversation_id, turn_id, seq, source, payload)
+             VALUES ($1, $2, $3, $4, 'user', $5)",
+        )
+        .bind(&item_id)
+        .bind(&conversation.id)
+        .bind(&turn_id)
+        .bind(first_seq + offset as i64)
+        .bind(payload)
+        .execute(&mut *tx)
+        .await?;
+        item_ids.push(item_id);
+    }
+    sqlx::query("UPDATE conversations SET next_seq = $2, updated_at = now() WHERE id = $1")
+        .bind(&conversation.id)
+        .bind(next_seq)
+        .execute(&mut *tx)
+        .await?;
+
+    let turn_start_id = new_id("tstart");
+    sqlx::query(
+        "INSERT INTO turn_starts
+         (id, tenant_id, owner_ref, client_id, idempotency_key, request_version,
+          request_digest, conversation_id, turn_id, first_seq, last_seq)
+         VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10)",
+    )
+    .bind(&turn_start_id)
+    .bind(&auth.tenant_id)
+    .bind(&auth.principal_id)
+    .bind(&auth.client_id)
+    .bind(&request.idempotency_key)
+    .bind(request_digest)
+    .bind(&conversation.id)
+    .bind(&turn_id)
+    .bind(first_seq)
+    .bind(last_seq)
+    .execute(&mut *tx)
+    .await?;
+    for (ordinal, item_id) in item_ids.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO turn_start_items (turn_start_id, ordinal, item_id, seq)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(&turn_start_id)
+        .bind(ordinal as i32)
+        .bind(item_id)
+        .bind(first_seq + ordinal as i64)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+
+    Ok(StartTurnResult {
+        conversation_id: conversation.id,
+        turn_id,
+        item_ids,
+        first_seq,
+        last_seq,
+        replayed: false,
+    })
+}
+
+fn turn_start_lock_key(tenant: &str, owner: &str, client: &str, key: &str) -> i64 {
+    let mut digest = Sha256::new();
+    digest.update(b"threadmark:turn-start-lock:v1\0");
+    for value in [tenant, owner, client, key] {
+        digest.update((value.len() as u32).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    i64::from_be_bytes(
+        digest.finalize()[..8]
+            .try_into()
+            .expect("eight digest bytes"),
+    )
+}
+
+#[cfg(test)]
+mod turn_start_tests {
+    use super::turn_start_lock_key;
+
+    #[test]
+    fn turn_start_lock_key_is_stable_and_framed() {
+        assert_eq!(
+            turn_start_lock_key("tenant", "owner", "client", "request"),
+            turn_start_lock_key("tenant", "owner", "client", "request")
+        );
+        assert_ne!(
+            turn_start_lock_key("ab", "c", "client", "request"),
+            turn_start_lock_key("a", "bc", "client", "request")
+        );
+        assert_ne!(
+            turn_start_lock_key("tenant", "owner", "client-a", "request"),
+            turn_start_lock_key("tenant", "owner", "client-b", "request")
+        );
+    }
 }
 
 pub async fn append_items(
@@ -461,8 +842,9 @@ pub async fn create_turn(
     Ok(sqlx::query_as::<_, Turn>(
         "INSERT INTO turns (id, conversation_id, agent_ref, idempotency_key)
          VALUES ($1, $2, $3, $4)
-         ON CONFLICT (conversation_id, idempotency_key) DO UPDATE
-         SET idempotency_key = EXCLUDED.idempotency_key RETURNING *",
+         ON CONFLICT (conversation_id, idempotency_key)
+         WHERE idempotency_key IS NOT NULL
+         DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key RETURNING *",
     )
     .bind(new_id("turn"))
     .bind(conversation_id)

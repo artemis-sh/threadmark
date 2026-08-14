@@ -1,11 +1,12 @@
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use serde::Deserialize;
 use sqlx::PgPool;
 use tower_http::trace::TraceLayer;
 
@@ -19,8 +20,8 @@ use crate::{
         Actor, AppendItems, AppendResult, Continuation, ContinuationQuery, Conversation,
         CreateContinuation, CreateConversation, CreateDownload, CreateTurn, DownloadDelivery,
         DownloadGrant, FileResponse, Item, ListConversationsQuery, ListItemsQuery,
-        RegenerateResult, ReplayRequest, ReplayResult, TruncateConversation, Turn,
-        UpdateConversation, UpdateTurn,
+        RegenerateResult, ReplayRequest, ReplayResult, StartTurn, StartTurnResult, StrictJson,
+        TruncateConversation, Turn, UpdateConversation, UpdateTurn, validate_json_number_tokens,
     },
     object_store::ObjectStore,
     store,
@@ -41,6 +42,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/conversations",
             get(list_conversations).post(create_conversation),
         )
+        .route("/v1/turn-starts", post(start_turn))
         .route(
             "/v1/conversations/{id}",
             get(get_conversation)
@@ -105,6 +107,39 @@ async fn create_conversation(
         StatusCode::CREATED,
         Json(store::create_conversation(&state.pool, &auth, request).await?),
     ))
+}
+
+async fn start_turn(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<StartTurnResult>)> {
+    let request = parse_start_turn(&body)?;
+    auth.require(Permission::TurnCreate)?;
+    auth.require(Permission::TranscriptAppend)?;
+    if request.conversation.is_some() {
+        auth.require(Permission::ConversationCreate)?;
+    }
+    let result = store::start_turn(&state.pool, &auth, request).await?;
+    let status = if result.replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(result)))
+}
+
+fn parse_start_turn(body: &[u8]) -> ApiResult<StartTurn> {
+    validate_json_number_tokens(body)
+        .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?;
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let StrictJson(value) = StrictJson::deserialize(&mut deserializer)
+        .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?;
+    deserializer
+        .end()
+        .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?;
+    serde_json::from_value(value)
+        .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))
 }
 
 async fn list_conversations(

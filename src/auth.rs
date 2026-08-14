@@ -38,6 +38,7 @@ struct JwtVerifier {
 #[derive(Clone, Debug)]
 pub struct AuthContext {
     pub actor: Actor,
+    pub client_id: String,
     permissions: HashSet<Permission>,
 }
 
@@ -229,6 +230,7 @@ impl Claims {
             || self.exp.saturating_sub(self.iat) > verifier.max_owner_seconds
             || !valid_id(&self.sub)
             || !valid_id(&self.client_id)
+            || self.client_id == "threadmark:trusted-headers"
             || !valid_id(&self.jti)
             || !valid_id(&self.tenant)
             || !valid_id(&self.principal)
@@ -245,6 +247,7 @@ impl Claims {
                 tenant_id: self.tenant,
                 principal_id: self.principal,
             },
+            client_id: self.client_id,
             permissions,
         })
     }
@@ -328,6 +331,7 @@ fn trusted_headers(headers: &HeaderMap) -> Result<AuthContext, ApiError> {
             tenant_id: required(headers, "x-threadmark-tenant")?,
             principal_id: required(headers, "x-threadmark-principal")?,
         },
+        client_id: "threadmark:trusted-headers".into(),
         permissions: OWNER_PERMISSIONS.into_iter().collect(),
     })
 }
@@ -409,6 +413,7 @@ mod tests {
         let context = verifier().authenticate(&headers(&claims())).unwrap();
         assert_eq!(context.tenant_id, "tenant-a");
         assert_eq!(context.principal_id, "user-a");
+        assert_eq!(context.client_id, "parley-test");
         assert!(context.require(Permission::ConversationRead).is_ok());
         assert!(matches!(
             context.require(Permission::ConversationDelete),
@@ -430,6 +435,16 @@ mod tests {
     fn rejects_unknown_permission() {
         let mut claims = claims();
         claims["permissions"] = json!(["conversation:read", "conversation:destroy"]);
+        assert!(matches!(
+            verifier().authenticate(&headers(&claims)),
+            Err(ApiError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn rejects_reserved_trusted_header_client_id_in_jwt() {
+        let mut claims = claims();
+        claims["client_id"] = json!("threadmark:trusted-headers");
         assert!(matches!(
             verifier().authenticate(&headers(&claims)),
             Err(ApiError::Unauthorized)
