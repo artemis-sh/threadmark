@@ -42,12 +42,16 @@ services:
       && mc mb --ignore-existing local/threadmark"
 
   threadmark:
-    build: .
+    build:
+      context: .
+      args:
+        CARGO_FEATURES: --features trusted-headers
     environment:
       DATABASE_URL: postgres://threadmark:threadmark@postgres:5432/threadmark
       LISTEN_ADDR: 0.0.0.0:8090
       PUBLIC_URL: http://localhost:8090
       THREADMARK_SECRET: local-development-secret-change-me
+      AUTH_MODE: trusted_headers
       FILE_MAX_MB: 32
       S3_ENDPOINT: http://minio:9000
       S3_PUBLIC_URL: http://localhost:9010

@@ -112,6 +112,11 @@ mod tests {
             s3_access_key_id: String::new(),
             s3_secret_access_key: String::new(),
             s3_force_path_style: true,
+            auth_mode: crate::config::AuthMode::Jwt,
+            auth_issuer: None,
+            auth_audience: None,
+            auth_jwks_url: None,
+            auth_max_owner_token_seconds: 300,
         }))
     }
 
