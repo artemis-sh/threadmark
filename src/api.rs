@@ -117,6 +117,7 @@ async fn start_turn(
     let request = parse_start_turn(&body)?;
     auth.require(Permission::TurnCreate)?;
     auth.require(Permission::TranscriptAppend)?;
+    auth.require_agent(request.agent_ref.trim())?;
     if request.conversation.is_some() {
         auth.require(Permission::ConversationCreate)?;
     }
@@ -237,6 +238,7 @@ async fn create_turn(
     Json(request): Json<CreateTurn>,
 ) -> ApiResult<(StatusCode, Json<Turn>)> {
     auth.require(Permission::TurnCreate)?;
+    auth.require_agent(request.agent_ref.trim())?;
     Ok((
         StatusCode::CREATED,
         Json(store::create_turn(&state.pool, &auth, &id, request).await?),

@@ -39,6 +39,7 @@ struct JwtVerifier {
 pub struct AuthContext {
     pub actor: Actor,
     pub client_id: String,
+    agent_ref: Option<String>,
     permissions: HashSet<Permission>,
 }
 
@@ -100,6 +101,7 @@ struct Claims {
     tenant: String,
     principal: String,
     permissions: Vec<String>,
+    agent_ref: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -234,6 +236,10 @@ impl Claims {
             || !valid_id(&self.jti)
             || !valid_id(&self.tenant)
             || !valid_id(&self.principal)
+            || self
+                .agent_ref
+                .as_deref()
+                .is_some_and(|value| !valid_id(value))
         {
             return None;
         }
@@ -248,6 +254,7 @@ impl Claims {
                 principal_id: self.principal,
             },
             client_id: self.client_id,
+            agent_ref: self.agent_ref,
             permissions,
         })
     }
@@ -259,6 +266,15 @@ impl AuthContext {
             .contains(&permission)
             .then_some(())
             .ok_or(ApiError::Forbidden)
+    }
+
+    pub fn require_agent(&self, agent_ref: &str) -> Result<(), ApiError> {
+        match &self.agent_ref {
+            Some(bound) if bound != agent_ref => {
+                Err(ApiError::NotFound("Agent resource not found.".into()))
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -332,6 +348,7 @@ fn trusted_headers(headers: &HeaderMap) -> Result<AuthContext, ApiError> {
             principal_id: required(headers, "x-threadmark-principal")?,
         },
         client_id: "threadmark:trusted-headers".into(),
+        agent_ref: None,
         permissions: OWNER_PERMISSIONS.into_iter().collect(),
     })
 }
@@ -448,6 +465,18 @@ mod tests {
         assert!(matches!(
             verifier().authenticate(&headers(&claims)),
             Err(ApiError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn retains_and_enforces_bound_agent() {
+        let mut claims = claims();
+        claims["agent_ref"] = json!("agent/prod");
+        let context = verifier().authenticate(&headers(&claims)).unwrap();
+        assert!(context.require_agent("agent/prod").is_ok());
+        assert!(matches!(
+            context.require_agent("agent/other"),
+            Err(ApiError::NotFound(_))
         ));
     }
 
