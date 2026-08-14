@@ -396,7 +396,7 @@ pub async fn start_turn(
         .collect::<Vec<_>>();
     file_ids.sort();
     file_ids.dedup();
-    for file_id in file_ids {
+    for file_id in &file_ids {
         let exists = sqlx::query_scalar::<_, String>(
             "SELECT id FROM files
              WHERE id = $1 AND tenant_id = $2 AND owner_ref = $3 FOR KEY SHARE",
@@ -446,6 +446,7 @@ pub async fn start_turn(
     let last_seq = next_seq - 1;
     let mut item_ids = Vec::with_capacity(request.items.len());
     for (offset, payload) in request.items.into_iter().enumerate() {
+        let file_ids = referenced_file_ids(&payload);
         let item_id = new_id("item");
         sqlx::query(
             "INSERT INTO conversation_items
@@ -459,6 +460,16 @@ pub async fn start_turn(
         .bind(payload)
         .execute(&mut *tx)
         .await?;
+        for file_id in file_ids {
+            sqlx::query(
+                "INSERT INTO conversation_item_files (item_id, file_id)
+                 VALUES ($1, $2)",
+            )
+            .bind(&item_id)
+            .bind(file_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         item_ids.push(item_id);
     }
     sqlx::query("UPDATE conversations SET next_seq = $2, updated_at = now() WHERE id = $1")
@@ -571,12 +582,6 @@ pub async fn append_items(
             "each item must be a JSON object".into(),
         ));
     }
-    for payload in &request.items {
-        for file_id in referenced_file_ids(payload) {
-            files::get_owned(pool, actor, &file_id).await?;
-        }
-    }
-
     let mut tx = pool.begin().await?;
     let conversation = lock_conversation(&mut tx, actor, conversation_id).await?;
     if let Some((first_seq, last_seq)) = sqlx::query_as::<_, (i64, i64)>(
@@ -619,10 +624,34 @@ pub async fn append_items(
         }
     }
 
+    let mut file_ids = request
+        .items
+        .iter()
+        .flat_map(referenced_file_ids)
+        .collect::<Vec<_>>();
+    file_ids.sort();
+    file_ids.dedup();
+    for file_id in &file_ids {
+        let exists = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM files
+             WHERE id = $1 AND tenant_id = $2 AND owner_ref = $3 FOR KEY SHARE",
+        )
+        .bind(file_id)
+        .bind(&actor.tenant_id)
+        .bind(&actor.principal_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        if !exists {
+            return Err(ApiError::NotFound("File not found.".into()));
+        }
+    }
+
     let first_seq = conversation.next_seq;
     let last_seq = first_seq + request.items.len() as i64 - 1;
     let mut inserted = Vec::with_capacity(request.items.len());
     for (offset, payload) in request.items.into_iter().enumerate() {
+        let file_ids = referenced_file_ids(&payload);
         inserted.push(
             sqlx::query_as::<_, Item>(
                 "INSERT INTO conversation_items
@@ -638,6 +667,17 @@ pub async fn append_items(
             .fetch_one(&mut *tx)
             .await?,
         );
+        let item_id = &inserted.last().expect("item was inserted").id;
+        for file_id in file_ids {
+            sqlx::query(
+                "INSERT INTO conversation_item_files (item_id, file_id)
+                 VALUES ($1, $2)",
+            )
+            .bind(item_id)
+            .bind(file_id)
+            .execute(&mut *tx)
+            .await?;
+        }
     }
     sqlx::query(
         "INSERT INTO append_batches (conversation_id, idempotency_key, first_seq, last_seq)

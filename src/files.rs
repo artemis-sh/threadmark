@@ -88,32 +88,80 @@ pub async fn remove(
     actor: &Actor,
     id: &str,
 ) -> ApiResult<()> {
-    let file = get_owned(pool, actor, id).await?;
-    let uri = file.uri();
-    let referenced = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(
-            SELECT 1 FROM conversation_items i
-            JOIN conversations c ON c.id = i.conversation_id
-            WHERE c.tenant_id = $1 AND c.owner_ref = $2
-              AND i.payload::text LIKE '%' || $3 || '%'
-        )",
+    let mut tx = pool.begin().await?;
+    let file = sqlx::query_as::<_, FileRecord>(
+        "SELECT * FROM files
+         WHERE id = $1 AND tenant_id = $2 AND owner_ref = $3 FOR UPDATE",
     )
+    .bind(id)
     .bind(&actor.tenant_id)
     .bind(&actor.principal_id)
-    .bind(uri)
-    .fetch_one(pool)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("File not found.".into()))?;
+    let referenced = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM conversation_item_files WHERE file_id = $1)
+         OR EXISTS(
+             SELECT 1 FROM conversation_items i
+             JOIN conversations c ON c.id = i.conversation_id
+             WHERE c.tenant_id = $2 AND c.owner_ref = $3
+               AND i.payload::text LIKE '%' || $4 || '%'
+         )",
+    )
+    .bind(id)
+    .bind(&actor.tenant_id)
+    .bind(&actor.principal_id)
+    .bind(file.uri())
+    .fetch_one(&mut *tx)
     .await?;
     if referenced {
         return Err(ApiError::Conflict(
             "File is referenced by a conversation and cannot be deleted.".into(),
         ));
     }
-    objects
-        .delete(&file.storage_key)
-        .await
-        .map_err(ApiError::ObjectStore)?;
     sqlx::query("DELETE FROM files WHERE id = $1")
         .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO file_deletion_outbox (file_id, storage_key) VALUES ($1, $2)")
+        .bind(id)
+        .bind(&file.storage_key)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    if let Err(error) = delete_pending(pool, objects, id, &file.storage_key).await {
+        tracing::error!(?error, file_id = %id, "file object cleanup deferred");
+    }
+    Ok(())
+}
+
+pub async fn cleanup_deletions(pool: &PgPool, objects: &ObjectStore) -> ApiResult<()> {
+    let pending = sqlx::query_as::<_, (String, String)>(
+        "SELECT file_id, storage_key FROM file_deletion_outbox ORDER BY created_at",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (file_id, storage_key) in pending {
+        if let Err(error) = delete_pending(pool, objects, &file_id, &storage_key).await {
+            tracing::error!(?error, %file_id, %storage_key, "file deletion cleanup failed");
+        }
+    }
+    Ok(())
+}
+
+async fn delete_pending(
+    pool: &PgPool,
+    objects: &ObjectStore,
+    file_id: &str,
+    storage_key: &str,
+) -> ApiResult<()> {
+    objects
+        .delete(storage_key)
+        .await
+        .map_err(ApiError::ObjectStore)?;
+    sqlx::query("DELETE FROM file_deletion_outbox WHERE file_id = $1")
+        .bind(file_id)
         .execute(pool)
         .await?;
     Ok(())
