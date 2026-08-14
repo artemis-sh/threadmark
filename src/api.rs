@@ -394,6 +394,12 @@ async fn delete_file(
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     auth.require(Permission::FileDelete)?;
+    if !state.config.file_transactional_delete_enabled {
+        return Err(ApiError::Conflict(
+            "File deletion is disabled until the transactional reference migration is complete."
+                .into(),
+        ));
+    }
     files::remove(&state.pool, &state.object_store, &auth, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

@@ -105,6 +105,7 @@ mod tests {
             secret: "a-secret-that-is-longer-than-32-bytes".into(),
             capability_ttl_seconds: 900,
             file_max_bytes: 32 * 1024 * 1024,
+            file_transactional_delete_enabled: false,
             s3_endpoint: String::new(),
             s3_public_url: None,
             s3_region: String::new(),

@@ -12,6 +12,7 @@ pub struct Inner {
     pub secret: String,
     pub capability_ttl_seconds: u64,
     pub file_max_bytes: usize,
+    pub file_transactional_delete_enabled: bool,
     pub s3_endpoint: String,
     pub s3_public_url: Option<String>,
     pub s3_region: String,
@@ -109,6 +110,12 @@ impl Config {
             secret,
             capability_ttl_seconds: parse("CAPABILITY_TTL_SECONDS", "900")?,
             file_max_bytes,
+            file_transactional_delete_enabled: std::env::var(
+                "FILE_TRANSACTIONAL_DELETE_ENABLED",
+            )
+            .unwrap_or_else(|_| "false".into())
+            .parse()
+            .context("FILE_TRANSACTIONAL_DELETE_ENABLED must be true or false")?,
             s3_endpoint: required("S3_ENDPOINT")?,
             s3_public_url: std::env::var("S3_PUBLIC_URL")
                 .ok()
