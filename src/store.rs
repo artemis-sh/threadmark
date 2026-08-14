@@ -43,6 +43,44 @@ fn coded_conflict(code: &'static str, message: &str) -> ApiError {
     }
 }
 
+fn normalize_title(value: Option<&str>) -> ApiResult<String> {
+    let title = value.unwrap_or("New conversation").trim();
+    if title.is_empty() || title.chars().count() > 200 {
+        return Err(ApiError::BadRequest(
+            "title must contain 1 to 200 characters".into(),
+        ));
+    }
+    Ok(title.to_owned())
+}
+
+fn turn_start_digest_v1(request: &StartTurn) -> ApiResult<Vec<u8>> {
+    let digest_input = match (
+        request.conversation_id.as_deref(),
+        request.conversation.as_ref(),
+    ) {
+        (Some(conversation_id), None) => TurnStartDigest::Existing {
+            operation: "turn_start",
+            version: 1,
+            conversation_id,
+            agent_ref: &request.agent_ref,
+            items: &request.items,
+        },
+        (None, Some(conversation)) => TurnStartDigest::Create {
+            operation: "turn_start",
+            version: 1,
+            conversation,
+            agent_ref: &request.agent_ref,
+            items: &request.items,
+        },
+        _ => unreachable!("conversation mode validated"),
+    };
+    Ok(Sha256::digest(
+        serde_json_canonicalizer::to_vec(&digest_input)
+            .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?,
+    )
+    .to_vec())
+}
+
 pub async fn create_conversation(
     pool: &PgPool,
     actor: &Actor,
@@ -53,12 +91,7 @@ pub async fn create_conversation(
             "metadata must be a JSON object".into(),
         ));
     }
-    let title = request.title.unwrap_or_else(|| "New conversation".into());
-    if title.trim().is_empty() || title.len() > 200 {
-        return Err(ApiError::BadRequest(
-            "title must contain 1 to 200 characters".into(),
-        ));
-    }
+    let title = normalize_title(request.title.as_deref())?;
     Ok(sqlx::query_as::<_, Conversation>(
         "INSERT INTO conversations (id, tenant_id, owner_ref, title, metadata)
          VALUES ($1, $2, $3, $4, $5) RETURNING *",
@@ -66,7 +99,7 @@ pub async fn create_conversation(
     .bind(new_id("conv"))
     .bind(&actor.tenant_id)
     .bind(&actor.principal_id)
-    .bind(title.trim())
+    .bind(title)
     .bind(request.metadata)
     .fetch_one(pool)
     .await?)
@@ -111,13 +144,11 @@ pub async fn update_conversation(
             "No conversation changes supplied.".into(),
         ));
     }
-    if let Some(title) = &request.title
-        && (title.trim().is_empty() || title.len() > 200)
-    {
-        return Err(ApiError::BadRequest(
-            "title must contain 1 to 200 characters".into(),
-        ));
-    }
+    let title = request
+        .title
+        .as_deref()
+        .map(|title| normalize_title(Some(title)))
+        .transpose()?;
     if let Some(metadata) = &request.metadata
         && !metadata.is_object()
     {
@@ -131,7 +162,7 @@ pub async fn update_conversation(
             updated_at = now()
          WHERE id = $3 AND tenant_id = $4 AND owner_ref = $5 RETURNING *",
     )
-    .bind(request.title.map(|title| title.trim().to_owned()))
+    .bind(title)
     .bind(request.metadata)
     .bind(id)
     .bind(&actor.tenant_id)
@@ -307,44 +338,10 @@ pub async fn start_turn(
                 "metadata must be a JSON object".into(),
             ));
         }
-        let title = conversation
-            .title
-            .as_deref()
-            .unwrap_or("New conversation")
-            .trim();
-        if title.is_empty() || title.chars().count() > 200 {
-            return Err(ApiError::BadRequest(
-                "title must contain 1 to 200 characters".into(),
-            ));
-        }
-        conversation.title = Some(title.to_owned());
+        conversation.title = Some(normalize_title(conversation.title.as_deref())?);
     }
 
-    let digest_input = match (
-        request.conversation_id.as_deref(),
-        request.conversation.as_ref(),
-    ) {
-        (Some(conversation_id), None) => TurnStartDigest::Existing {
-            operation: "turn_start",
-            version: 1,
-            conversation_id,
-            agent_ref: &request.agent_ref,
-            items: &request.items,
-        },
-        (None, Some(conversation)) => TurnStartDigest::Create {
-            operation: "turn_start",
-            version: 1,
-            conversation,
-            agent_ref: &request.agent_ref,
-            items: &request.items,
-        },
-        _ => unreachable!("conversation mode validated"),
-    };
-    let request_digest = Sha256::digest(
-        serde_json_canonicalizer::to_vec(&digest_input)
-            .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?,
-    )
-    .to_vec();
+    let request_digest = turn_start_digest_v1(&request)?;
     let lock_key = turn_start_lock_key(
         &auth.tenant_id,
         &auth.principal_id,
@@ -358,20 +355,36 @@ pub async fn start_turn(
         .execute(&mut *tx)
         .await?;
 
-    if let Some((turn_start_id, stored_digest, conversation_id, turn_id, first_seq, last_seq)) =
-        sqlx::query_as::<_, (String, Vec<u8>, String, String, i64, i64)>(
-            "SELECT id, request_digest, conversation_id, turn_id, first_seq, last_seq
+    if let Some((
+        turn_start_id,
+        request_version,
+        stored_digest,
+        conversation_id,
+        turn_id,
+        first_seq,
+        last_seq,
+    )) = sqlx::query_as::<_, (String, i16, Vec<u8>, String, String, i64, i64)>(
+        "SELECT id, request_version, request_digest, conversation_id, turn_id, first_seq, last_seq
              FROM turn_starts
              WHERE tenant_id = $1 AND owner_ref = $2 AND client_id = $3
                AND idempotency_key = $4",
-        )
-        .bind(&auth.tenant_id)
-        .bind(&auth.principal_id)
-        .bind(&auth.client_id)
-        .bind(&request.idempotency_key)
-        .fetch_optional(&mut *tx)
-        .await?
+    )
+    .bind(&auth.tenant_id)
+    .bind(&auth.principal_id)
+    .bind(&auth.client_id)
+    .bind(&request.idempotency_key)
+    .fetch_optional(&mut *tx)
+    .await?
     {
+        let request_digest = match request_version {
+            1 => turn_start_digest_v1(&request)?,
+            _ => {
+                return Err(coded_conflict(
+                    "idempotency_version_unsupported",
+                    "the original request version is not supported by this server",
+                ));
+            }
+        };
         if stored_digest != request_digest {
             if let Some(conversation_id) = &request.conversation_id {
                 let owned = sqlx::query_scalar::<_, bool>(
@@ -402,12 +415,12 @@ pub async fn start_turn(
         .fetch_optional(&mut *tx)
         .await?
         .is_some();
-        let item_ids = sqlx::query_scalar::<_, String>(
-            "SELECT tsi.item_id
+        let children = sqlx::query_as::<_, (i32, String, i64, Option<String>)>(
+            "SELECT tsi.ordinal, tsi.item_id, tsi.seq, i.id
              FROM turn_start_items tsi
-             JOIN conversation_items i ON i.id = tsi.item_id
-             WHERE tsi.turn_start_id = $1 AND i.conversation_id = $2
-               AND i.turn_id = $3 AND i.seq = tsi.seq
+             LEFT JOIN conversation_items i ON i.id = tsi.item_id
+               AND i.conversation_id = $2 AND i.turn_id = $3 AND i.seq = tsi.seq
+             WHERE tsi.turn_start_id = $1
              ORDER BY tsi.ordinal",
         )
         .bind(&turn_start_id)
@@ -415,12 +428,24 @@ pub async fn start_turn(
         .bind(&turn_id)
         .fetch_all(&mut *tx)
         .await?;
-        if !conversation_exists || item_ids.len() != (last_seq - first_seq + 1) as usize {
+        let expected_count = last_seq - first_seq + 1;
+        let valid_children = expected_count > 0
+            && children.len() == expected_count as usize
+            && children.iter().enumerate().all(|(index, child)| {
+                child.0 == index as i32
+                    && child.2 == first_seq + index as i64
+                    && child.3.as_deref() == Some(child.1.as_str())
+            });
+        if !conversation_exists || !valid_children {
             return Err(coded_conflict(
                 "idempotency_result_deleted",
                 "the original turn start result is no longer available",
             ));
         }
+        let item_ids = children
+            .into_iter()
+            .map(|(_, item_id, _, _)| item_id)
+            .collect();
         tx.commit().await?;
         return Ok(StartTurnResult {
             conversation_id,

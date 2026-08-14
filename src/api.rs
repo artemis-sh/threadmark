@@ -114,6 +114,11 @@ async fn start_turn(
     auth: AuthContext,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<StartTurnResult>)> {
+    if !state.config.atomic_turn_start_enabled {
+        return Err(ApiError::Conflict(
+            "Atomic turn start is disabled until the file-reference migration is complete.".into(),
+        ));
+    }
     let request = parse_start_turn(&body)?;
     auth.require(Permission::TurnCreate)?;
     auth.require(Permission::TranscriptAppend)?;
@@ -238,6 +243,11 @@ async fn create_turn(
     Json(request): Json<CreateTurn>,
 ) -> ApiResult<(StatusCode, Json<Turn>)> {
     auth.require(Permission::TurnCreate)?;
+    if !state.config.atomic_turn_start_enabled {
+        return Err(ApiError::Conflict(
+            "Turn creation is disabled until the file-reference migration is complete.".into(),
+        ));
+    }
     auth.require_agent(request.agent_ref.trim())?;
     Ok((
         StatusCode::CREATED,

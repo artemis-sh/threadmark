@@ -13,6 +13,7 @@ pub struct Inner {
     pub capability_ttl_seconds: u64,
     pub file_max_bytes: usize,
     pub file_transactional_delete_enabled: bool,
+    pub atomic_turn_start_enabled: bool,
     pub s3_endpoint: String,
     pub s3_public_url: Option<String>,
     pub s3_region: String,
@@ -114,6 +115,10 @@ impl Config {
                 .unwrap_or_else(|_| "false".into())
                 .parse()
                 .context("FILE_TRANSACTIONAL_DELETE_ENABLED must be true or false")?,
+            atomic_turn_start_enabled: std::env::var("ATOMIC_TURN_START_ENABLED")
+                .unwrap_or_else(|_| "false".into())
+                .parse()
+                .context("ATOMIC_TURN_START_ENABLED must be true or false")?,
             s3_endpoint: required("S3_ENDPOINT")?,
             s3_public_url: std::env::var("S3_PUBLIC_URL")
                 .ok()
