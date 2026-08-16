@@ -268,6 +268,10 @@ impl AuthContext {
             .ok_or(ApiError::Forbidden)
     }
 
+    pub fn agent_ref(&self) -> Option<&str> {
+        self.agent_ref.as_deref()
+    }
+
     pub fn require_agent(&self, agent_ref: &str) -> Result<(), ApiError> {
         match &self.agent_ref {
             Some(bound) if bound != agent_ref => {

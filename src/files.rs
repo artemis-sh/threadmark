@@ -48,7 +48,7 @@ pub async fn save(
     match inserted {
         Ok(file) => Ok(file),
         Err(error) => {
-            if let Err(cleanup_error) = objects.delete(&storage_key).await {
+            if let Err(cleanup_error) = delete_all_versions(objects, &storage_key).await {
                 tracing::error!(?cleanup_error, %storage_key, "failed to clean up untracked object");
             }
             Err(ApiError::Database(error))
@@ -148,14 +148,25 @@ async fn delete_pending(
     file_id: &str,
     storage_key: &str,
 ) -> ApiResult<()> {
-    objects
-        .delete(storage_key)
-        .await
-        .map_err(ApiError::ObjectStore)?;
+    delete_all_versions(objects, storage_key).await?;
     sqlx::query("DELETE FROM file_deletion_outbox WHERE file_id = $1")
         .bind(file_id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+async fn delete_all_versions(objects: &ObjectStore, storage_key: &str) -> ApiResult<()> {
+    for version_id in objects
+        .versions(storage_key)
+        .await
+        .map_err(ApiError::ObjectStore)?
+    {
+        objects
+            .delete_version(storage_key, &version_id)
+            .await
+            .map_err(ApiError::ObjectStore)?;
+    }
     Ok(())
 }
 

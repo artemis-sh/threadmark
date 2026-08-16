@@ -108,10 +108,13 @@ cargo run
 Migrations run automatically at startup. The API listens on port `8090` by
 default, and `GET /health` checks database connectivity.
 
-The S3-compatible bucket must exist before Threadmark starts. Compose creates a
-local MinIO bucket automatically. In production, configure `S3_ENDPOINT`,
-`S3_BUCKET`, credentials, and optionally a separately reachable
-`S3_PUBLIC_URL` for direct presigned delivery.
+The S3-compatible bucket must exist before Threadmark starts and must have
+versioning enabled. This is a global alpha storage prerequisite, including for
+the retained server-mediated `POST /v1/files` endpoint, so Threadmark can
+delete every object version safely. Compose creates and version-enables a local
+MinIO bucket automatically. In production, configure `S3_ENDPOINT`,
+`S3_BUCKET`, credentials with `s3:GetBucketVersioning`, and optionally a
+separately reachable `S3_PUBLIC_URL` for direct presigned delivery.
 
 With the stack running, `scripts/media-smoke.sh` verifies upload, all replay
 delivery policies, byte integrity, ownership isolation, and referenced-file
