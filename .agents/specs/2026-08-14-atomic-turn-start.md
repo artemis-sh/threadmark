@@ -458,34 +458,12 @@ but follow-up work should make altered retries of turn creation and append retur
 
 ### Deployment
 
-Schema changes use expand/contract rollouts so old binaries remain valid:
-
-1. Add normalized reference and snapshot tables, turn-start tables, and
-   supporting unique keys without changing existing constraints. Keep atomic
-   start, delegated snapshot issuance, and file deletion disabled. Deploy dual
-   writes and common conversation-then-file locking to every item/turn path, then
-   drain every old item, turn, and deletion binary before proceeding.
-2. Backfill item-file rows with application parsing while dual writes are live,
-   repeat against a stable item-ID watermark until no gaps remain, then establish
-   a brief append write barrier for final verification. Validate foreign keys and
-   counts. Pre-verification turn creation writes no snapshot parent and remains
-   ineligible for delegated access. Only after verification may new turn paths
-   create `authoritative=true` snapshots. Deploy transactional file deletion that
-   checks both normalized relations and writes a durable cleanup outbox; retain
-   old textual reference checks as defense in depth.
-3. Make `turns.idempotency_key` nullable and add the partial unique index while
-   retaining the old full unique constraint. Deploy transaction-based ordinary
-   turn creation that does not depend on conflict inference, drain old binaries,
-   then drop the full unique constraint.
-4. Audit and reject or repair every existing item whose turn belongs to another
-   conversation. Add the composite item-to-turn key as `NOT VALID`, validate it,
-   then replace the old single-column key. Enable atomic turn start only after
-   every prerequisite is active.
-
-Before transactional ordinary turn replay is deployed, audit existing
-`turns.agent_ref` values and backfill them to the normalized trimmed form,
-rejecting collisions or invalid empty/overlength values for manual repair. This
-ensures historically exact keyed retries compare under the new shared rule.
+Threadmark is pre-release, so the schema migrations and application behavior ship
+together without compatibility gates for older binaries. Migrations backfill
+normalized file references, reject cross-conversation item/turn corruption, and
+install the constraints required by atomic turn start before the service accepts
+traffic. Transactional file deletion and atomic turn start are then active by
+default.
 
 Potentially blocking schema changes use PostgreSQL's online patterns: add
 `conversations_next_seq_check` as `NOT VALID` and validate it separately; create

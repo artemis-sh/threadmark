@@ -101,18 +101,9 @@ pub async fn remove(
     .ok_or_else(|| ApiError::NotFound("File not found.".into()))?;
     let referenced = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM conversation_item_files WHERE file_id = $1)
-         OR EXISTS(SELECT 1 FROM turn_file_snapshot_files WHERE file_id = $1)
-         OR EXISTS(
-             SELECT 1 FROM conversation_items i
-             JOIN conversations c ON c.id = i.conversation_id
-             WHERE c.tenant_id = $2 AND c.owner_ref = $3
-               AND i.payload::text LIKE '%' || $4 || '%'
-         )",
+         OR EXISTS(SELECT 1 FROM turn_file_snapshot_files WHERE file_id = $1)",
     )
     .bind(id)
-    .bind(&actor.tenant_id)
-    .bind(&actor.principal_id)
-    .bind(file.uri())
     .fetch_one(&mut *tx)
     .await?;
     if referenced {
