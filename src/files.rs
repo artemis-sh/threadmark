@@ -3,11 +3,11 @@ use serde_json::Value;
 use sqlx::{Decode, Encode, Executor, IntoArguments, Pool, Type};
 
 use crate::{
+    blob::ObjectStore,
     db::Backend,
     error::{ApiError, ApiResult},
     ids::new_id,
     model::{Actor, FileRecord},
-    object_store::ObjectStore,
     store::SqlStore,
 };
 

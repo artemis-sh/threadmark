@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    body::{Body, Bytes},
+    body::Bytes,
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
@@ -11,6 +11,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::{
     auth::{AuthContext, Authenticator, Permission},
+    blob::ObjectStore,
     capability,
     config::Config,
     error::{ApiError, ApiResult},
@@ -21,7 +22,6 @@ use crate::{
         RegenerateResult, ReplayRequest, ReplayResult, StartTurn, StartTurnResult, StrictJson,
         TruncateConversation, Turn, UpdateConversation, UpdateTurn, validate_json_number_tokens,
     },
-    object_store::ObjectStore,
     uploads,
 };
 
@@ -496,7 +496,7 @@ async fn create_file_download(
     if request.delivery == DownloadDelivery::Redirect && !state.object_store.supports_public_urls()
     {
         return Err(ApiError::BadRequest(
-            "redirect delivery requires S3_PUBLIC_URL".into(),
+            "redirect delivery requires an S3 blob backend with S3_PUBLIC_URL set.".into(),
         ));
     }
     Ok(Json(capability::file_url(
@@ -552,7 +552,7 @@ async fn stream_file(state: &AppState, file: crate::model::FileRecord) -> ApiRes
         .get_stream(&file.storage_key)
         .await
         .map_err(ApiError::ObjectStore)?;
-    let body = Body::from_stream(tokio_util::io::ReaderStream::new(stream.into_async_read()));
+    let body = stream.into_body();
     let disposition = content_disposition(&file.filename);
     let mut response = Response::new(body);
     let headers = response.headers_mut();

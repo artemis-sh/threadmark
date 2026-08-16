@@ -112,6 +112,8 @@ mod tests {
             s3_access_key_id: String::new(),
             s3_secret_access_key: String::new(),
             s3_force_path_style: true,
+            blob_backend: crate::config::BlobBackend::S3,
+            blob_dir: None,
             direct_upload_enabled: false,
             sqlite_busy_timeout_ms: 5000,
             sqlite_synchronous_full: true,

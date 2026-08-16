@@ -33,3 +33,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = "1"
 url = "2"
+
+[dev-dependencies]
+tempdir = "0.3.7"

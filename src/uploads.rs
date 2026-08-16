@@ -8,12 +8,12 @@ use sqlx::{Decode, Encode, Executor, FromRow, IntoArguments, Pool, Type};
 
 use crate::{
     auth::AuthContext,
+    blob::{ObjectStore, PresignedPost},
     config::Config,
     db::Backend,
     error::{ApiError, ApiResult},
     ids::new_id,
     model::{FileRecord, FileResponse},
-    object_store::{ObjectStore, PresignedPost},
     store::SqlStore,
 };
 
@@ -99,11 +99,7 @@ where
                 message: "Direct browser uploads are unavailable.".into(),
             });
         }
-        if !objects
-            .versioning_enabled()
-            .await
-            .map_err(ApiError::ObjectStore)?
-        {
+        if !objects.is_versioned() {
             return Err(ApiError::CodedUnavailable {
                 code: "direct_upload_unavailable",
                 message: "Direct browser uploads require bucket versioning.".into(),

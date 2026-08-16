@@ -19,6 +19,8 @@ pub struct Inner {
     pub s3_access_key_id: String,
     pub s3_secret_access_key: String,
     pub s3_force_path_style: bool,
+    pub blob_backend: BlobBackend,
+    pub blob_dir: Option<String>,
     pub direct_upload_enabled: bool,
     pub sqlite_busy_timeout_ms: u64,
     pub sqlite_synchronous_full: bool,
@@ -29,6 +31,12 @@ pub struct Inner {
     pub auth_audience: Option<String>,
     pub auth_jwks_url: Option<String>,
     pub auth_max_owner_token_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobBackend {
+    S3,
+    Filesystem,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +78,23 @@ impl Config {
             .and_then(|value| value.checked_mul(1024 * 1024))
             .context("FILE_MAX_MB is too large")?;
 
+        let blob_backend = match std::env::var("BLOB_BACKEND")
+            .unwrap_or_else(|_| "s3".into())
+            .as_str()
+        {
+            "s3" => BlobBackend::S3,
+            "filesystem" => BlobBackend::Filesystem,
+            other => anyhow::bail!("BLOB_BACKEND must be s3 or filesystem, got {other}"),
+        };
+        let blob_dir = std::env::var("BLOB_DIR").ok().filter(|v| !v.is_empty());
+        // S3 credentials are only meaningful for the S3 backend; a filesystem
+        // deployment should not have to invent them.
+        let s3_setting = |name: &str| -> anyhow::Result<String> {
+            match blob_backend {
+                BlobBackend::S3 => required(name),
+                BlobBackend::Filesystem => Ok(String::new()),
+            }
+        };
         let auth_mode = match required("AUTH_MODE")?.as_str() {
             "jwt" => AuthMode::Jwt,
             #[cfg(feature = "trusted-headers")]
@@ -136,18 +161,20 @@ impl Config {
             secret,
             capability_ttl_seconds: parse("CAPABILITY_TTL_SECONDS", "900")?,
             file_max_bytes,
-            s3_endpoint: required("S3_ENDPOINT")?,
+            s3_endpoint: s3_setting("S3_ENDPOINT")?,
             s3_public_url: std::env::var("S3_PUBLIC_URL")
                 .ok()
                 .filter(|value| !value.is_empty()),
             s3_region: std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
-            s3_bucket: required("S3_BUCKET")?,
-            s3_access_key_id: required("S3_ACCESS_KEY_ID")?,
-            s3_secret_access_key: required("S3_SECRET_ACCESS_KEY")?,
+            s3_bucket: s3_setting("S3_BUCKET")?,
+            s3_access_key_id: s3_setting("S3_ACCESS_KEY_ID")?,
+            s3_secret_access_key: s3_setting("S3_SECRET_ACCESS_KEY")?,
             s3_force_path_style: std::env::var("S3_FORCE_PATH_STYLE")
                 .unwrap_or_else(|_| "true".into())
                 .parse()
                 .context("S3_FORCE_PATH_STYLE must be true or false")?,
+            blob_backend,
+            blob_dir,
             direct_upload_enabled,
             sqlite_busy_timeout_ms: parse("SQLITE_BUSY_TIMEOUT_MS", "5000")?,
             // FULL survives power loss; NORMAL survives process death and is

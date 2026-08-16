@@ -14,7 +14,7 @@ use sha2::Sha256;
 use crate::config::Config;
 
 #[derive(Clone)]
-pub struct ObjectStore {
+pub struct S3Store {
     client: Client,
     public_client: Option<Client>,
     bucket: String,
@@ -42,7 +42,7 @@ pub struct ObjectHead {
     pub version_id: Option<String>,
 }
 
-impl ObjectStore {
+impl S3Store {
     pub fn new(config: &Config) -> Self {
         let client = build_client(config, &config.s3_endpoint);
         let public_client = config
@@ -433,7 +433,7 @@ fn build_client(config: &Config, endpoint: &str) -> Client {
 mod tests {
     use std::sync::Arc;
 
-    use super::{ObjectStore, post_url};
+    use super::{S3Store, post_url};
     use crate::config::{Config, Inner};
 
     fn config(direct_upload_enabled: bool) -> Config {
@@ -451,6 +451,8 @@ mod tests {
             s3_access_key_id: "key".into(),
             s3_secret_access_key: "secret".into(),
             s3_force_path_style: true,
+            blob_backend: crate::config::BlobBackend::S3,
+            blob_dir: None,
             direct_upload_enabled,
             sqlite_busy_timeout_ms: 5000,
             sqlite_synchronous_full: true,
@@ -468,15 +470,15 @@ mod tests {
     fn versioning_defaults_to_absent_until_probed() {
         // `ensure_ready` has not run, so deletion must take the conservative
         // single-object path rather than assuming versions can be enumerated.
-        assert!(!ObjectStore::new(&config(false)).is_versioned());
-        assert!(!ObjectStore::new(&config(true)).is_versioned());
+        assert!(!S3Store::new(&config(false)).is_versioned());
+        assert!(!S3Store::new(&config(true)).is_versioned());
     }
 
     #[test]
     fn versioning_result_is_shared_with_clones() {
         // `ensure_ready` runs once on the original before the store is cloned
         // into the router state and the cleanup task; both must observe it.
-        let store = ObjectStore::new(&config(false));
+        let store = S3Store::new(&config(false));
         let clone = store.clone();
         store.versioned.set(true).expect("first write wins");
         assert!(store.is_versioned());

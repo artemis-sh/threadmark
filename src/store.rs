@@ -9,6 +9,7 @@ use sqlx::{Decode, Encode, Executor, IntoArguments, Pool, Transaction, Type};
 
 use crate::{
     auth::AuthContext,
+    blob::ObjectStore,
     capability,
     config::Config,
     db::{Backend, UniqueIndex, in_list},
@@ -20,7 +21,6 @@ use crate::{
         CreateConversation, CreateTurn, FileDelivery, Item, ReplayRequest, ReplayResult, StartTurn,
         StartTurnResult, Turn, UpdateConversation, UpdateTurn,
     },
-    object_store::ObjectStore,
 };
 
 #[derive(Serialize)]
@@ -994,7 +994,8 @@ where
                         .map_err(ApiError::ObjectStore)?
                         .ok_or_else(|| {
                             ApiError::BadRequest(
-                                "presigned_url delivery requires S3_PUBLIC_URL".into(),
+                                "presigned_url delivery requires an S3 blob backend with S3_PUBLIC_URL set."
+                                    .into(),
                             )
                         })?;
                     object.insert(field.into(), Value::String(url));

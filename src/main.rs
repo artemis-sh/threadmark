@@ -1,5 +1,6 @@
 mod api;
 mod auth;
+mod blob;
 mod capability;
 mod config;
 mod db;
@@ -7,7 +8,6 @@ mod error;
 mod files;
 mod ids;
 mod model;
-mod object_store;
 mod store;
 mod uploads;
 
@@ -37,7 +37,8 @@ async fn main() -> anyhow::Result<()> {
         .context("initialize authentication")?;
     let store = connect_store(&config).await?;
 
-    let object_store = object_store::ObjectStore::new(&config);
+    blob::validate(&config)?;
+    let object_store = blob::ObjectStore::new(&config);
     object_store.ensure_ready().await?;
     store
         .cleanup_deletions(&object_store)
