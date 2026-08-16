@@ -2,6 +2,9 @@
 set -euo pipefail
 
 base_url="${THREADMARK_URL:-http://127.0.0.1:8090}"
+# Presigned delivery needs an S3 blob backend. Set PRESIGNED=0 to check only the
+# modes a filesystem deployment serves.
+presigned="${PRESIGNED:-1}"
 tenant="smoke-media-$(date +%s)"
 principal="user_1"
 fixture="${1:-README.md}"
@@ -36,24 +39,32 @@ preserved=$(replay preserve | jq -r '.input[0].content[0].file_url')
 [[ "$preserved" == "$file_uri" ]]
 
 capability_url=$(replay capability_url | jq -r '.input[0].content[0].file_url')
-presigned_url=$(replay presigned_url | jq -r '.input[0].content[0].file_url')
+if [[ "$presigned" == "1" ]]; then
+  presigned_url=$(replay presigned_url | jq -r '.input[0].content[0].file_url')
+fi
 inline_data=$(replay inline | jq -r '.input[0].content[0].file_data')
-redirect_grant=$(curl -fsS "$base_url/v1/files/$file_id/downloads" "${headers[@]}" \
-  -H 'content-type: application/json' -d '{"delivery":"redirect"}')
+if [[ "$presigned" == "1" ]]; then
+  redirect_grant=$(curl -fsS "$base_url/v1/files/$file_id/downloads" "${headers[@]}" \
+    -H 'content-type: application/json' -d '{"delivery":"redirect"}')
+fi
 proxy_grant=$(curl -fsS "$base_url/v1/files/$file_id/downloads" "${headers[@]}" \
   -H 'content-type: application/json' -d '{"delivery":"proxy"}')
 
 source_hash=$(sha256sum "$fixture" | cut -d ' ' -f 1)
 capability_hash=$(curl -fsS "$capability_url" | sha256sum | cut -d ' ' -f 1)
-presigned_hash=$(curl -fsS "$presigned_url" | sha256sum | cut -d ' ' -f 1)
+if [[ "$presigned" == "1" ]]; then
+  presigned_hash=$(curl -fsS "$presigned_url" | sha256sum | cut -d ' ' -f 1)
+fi
 inline_hash=$(base64 -d <<<"$inline_data" | sha256sum | cut -d ' ' -f 1)
-redirect_hash=$(curl -fsSL "$(jq -r .url <<<"$redirect_grant")" | sha256sum | cut -d ' ' -f 1)
+if [[ "$presigned" == "1" ]]; then
+  redirect_hash=$(curl -fsSL "$(jq -r .url <<<"$redirect_grant")" | sha256sum | cut -d ' ' -f 1)
+fi
 proxy_hash=$(curl -fsS "$(jq -r .url <<<"$proxy_grant")" | sha256sum | cut -d ' ' -f 1)
 
 [[ "$source_hash" == "$capability_hash" ]]
-[[ "$source_hash" == "$presigned_hash" ]]
+if [[ "$presigned" == "1" ]]; then [[ "$source_hash" == "$presigned_hash" ]]; fi
 [[ "$source_hash" == "$inline_hash" ]]
-[[ "$source_hash" == "$redirect_hash" ]]
+if [[ "$presigned" == "1" ]]; then [[ "$source_hash" == "$redirect_hash" ]]; fi
 [[ "$source_hash" == "$proxy_hash" ]]
 
 foreign_status=$(curl -sS -o /dev/null -w '%{http_code}' \

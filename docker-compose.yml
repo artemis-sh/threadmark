@@ -69,6 +69,29 @@ services:
       bucket-init:
         condition: service_completed_successfully
 
+  # Single-node shape: SQLite plus filesystem storage, no Postgres and no MinIO.
+  #   docker compose --profile local up threadmark-local
+  threadmark-local:
+    profiles: ["local"]
+    build:
+      context: .
+      args:
+        CARGO_FEATURES: --features trusted-headers
+    environment:
+      DATABASE_URL: sqlite:///data/threadmark.db
+      BLOB_BACKEND: filesystem
+      BLOB_DIR: /data/blobs
+      LISTEN_ADDR: 0.0.0.0:8090
+      PUBLIC_URL: http://localhost:8091
+      THREADMARK_SECRET: local-development-secret-change-me
+      AUTH_MODE: trusted_headers
+      FILE_MAX_MB: 32
+    ports:
+      - "8091:8090"
+    volumes:
+      - threadmark-local:/data
+
 volumes:
   threadmark-postgres:
   threadmark-minio:
+  threadmark-local:

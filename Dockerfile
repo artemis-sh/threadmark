@@ -11,6 +11,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 threadmark
 COPY --from=build /src/target/release/threadmark /usr/local/bin/threadmark
+# Present and owned by the runtime user so a named volume mounted here inherits
+# that ownership. Without it the single-node shape cannot create its database
+# file or blob directory.
+RUN mkdir -p /data && chown threadmark:threadmark /data
 USER threadmark
+VOLUME ["/data"]
 EXPOSE 8090
 ENTRYPOINT ["threadmark"]

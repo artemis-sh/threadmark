@@ -72,7 +72,7 @@ by the signature and cannot be changed by the recipient.
 
 This is an experiment and its API is not stable. The current slice establishes:
 
-- Postgres-backed, tenant-isolated conversations.
+- Tenant-isolated conversations on PostgreSQL or SQLite.
 - Transactional, gap-free item ordering within each conversation.
 - Idempotent item batches and turn creation.
 - Cursor-based item reads.
@@ -89,7 +89,52 @@ edit/regenerate operations, and authenticated file content reads for the Parley
 server adapter. The trusted-header identity boundary remains experimental and
 requires network isolation until service authentication is implemented.
 
+## Deployment shapes
+
+Threadmark runs in two shapes. PostgreSQL with S3-compatible storage is the
+production self-hosting target and defines the behaviour; SQLite with local
+filesystem storage is for single-node deployments and conforms to it.
+
+| | Production | Single-node |
+| --- | --- | --- |
+| Database | PostgreSQL | SQLite file |
+| Blobs | S3 / MinIO | Local directory |
+| `DATABASE_URL` | `postgres://...` | `sqlite://./data/threadmark.db` |
+| `BLOB_BACKEND` | `s3` | `filesystem` |
+| Direct browser upload | yes, presigned POST | no |
+| Presigned download | yes | no, proxied |
+| Concurrent writers | yes | single process |
+
+The engine is chosen by the `DATABASE_URL` scheme, so there is no separate
+backend setting to keep consistent with it.
+
+The single-node shape declines direct browser upload and presigned download
+rather than emulating them. The server-mediated `POST /v1/files` endpoint and
+the streaming download proxy cover both, so no API is unavailable — only the
+delivery mode differs. Requests for a mode the backend cannot serve are refused
+with a message naming the requirement.
+
+**SQLite admits one writer at a time.** A single-node deployment must run as one
+process. Do not point several replicas at the same database file.
+
 ## Run
+
+### Single-node
+
+No database or object storage service to run:
+
+```bash
+export DATABASE_URL="sqlite://./data/threadmark.db"
+export BLOB_BACKEND=filesystem
+export BLOB_DIR=./data/blobs
+export THREADMARK_SECRET="replace-with-at-least-32-random-characters"
+export AUTH_MODE=jwt AUTH_ISSUER=... AUTH_AUDIENCE=... AUTH_JWKS_URL=...
+cargo run --release
+```
+
+The database file and blob directory are created on first start.
+
+### Production
 
 Start the complete local stack:
 
@@ -97,7 +142,7 @@ Start the complete local stack:
 docker compose up --build
 ```
 
-Or start only Postgres and run the Rust service locally:
+Or start only the dependencies and run the service locally:
 
 ```bash
 docker compose up -d postgres minio bucket-init
@@ -105,8 +150,10 @@ set -a; source .env; set +a
 cargo run
 ```
 
-Migrations run automatically at startup. The API listens on port `8090` by
-default, and `GET /health` checks database connectivity.
+Migrations run automatically at startup, from `migrations/postgres` or
+`migrations/sqlite` according to the configured engine. The API listens on port
+`8090` by default, and `GET /health` checks database and object-store
+connectivity.
 
 The S3-compatible bucket must exist before Threadmark starts. Bucket versioning
 is **required** when `DIRECT_UPLOAD_ENABLED=true`, because direct browser
