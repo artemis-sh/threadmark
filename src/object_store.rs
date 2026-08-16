@@ -1,3 +1,4 @@
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -22,6 +23,8 @@ pub struct ObjectStore {
     access_key_id: String,
     secret_access_key: String,
     force_path_style: bool,
+    direct_upload_enabled: bool,
+    versioned: Arc<OnceLock<bool>>,
 }
 
 #[derive(Serialize)]
@@ -55,7 +58,50 @@ impl ObjectStore {
             access_key_id: config.s3_access_key_id.clone(),
             secret_access_key: config.s3_secret_access_key.clone(),
             force_path_style: config.s3_force_path_style,
+            direct_upload_enabled: config.direct_upload_enabled,
+            versioned: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Verify the bucket is reachable and satisfies the requirements implied by
+    /// the active configuration, then cache whether the bucket is versioned.
+    ///
+    /// Bucket versioning is only required for direct browser uploads, which pin
+    /// the server-side copy to the exact object version Threadmark validated. A
+    /// deployment with `DIRECT_UPLOAD_ENABLED=false` may run against a bucket
+    /// that has never had versioning enabled; deletion falls back to removing
+    /// the current object instead of enumerating versions.
+    ///
+    /// Must be called once, before the store is shared, so that later clones
+    /// observe the cached result.
+    pub async fn ensure_ready(&self) -> anyhow::Result<()> {
+        self.ping().await.context("access S3 bucket")?;
+        let versioned = self
+            .versioning_enabled()
+            .await
+            .context("determine S3 bucket versioning")?;
+        if self.direct_upload_enabled && !versioned {
+            anyhow::bail!(
+                "S3 bucket versioning must be Enabled when DIRECT_UPLOAD_ENABLED is true"
+            );
+        }
+        let _ = self.versioned.set(versioned);
+        if !versioned {
+            tracing::warn!(
+                "S3 bucket versioning is not enabled; deleting a file removes the current \
+                 object only, and direct browser uploads are unavailable"
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether the bucket reported versioning `Enabled` during [`Self::ensure_ready`].
+    ///
+    /// Defaults to `false` when `ensure_ready` has not run, so callers take the
+    /// conservative single-object deletion path rather than assuming versions
+    /// can be enumerated.
+    pub fn is_versioned(&self) -> bool {
+        self.versioned.get().copied().unwrap_or(false)
     }
 
     pub async fn ping(&self) -> anyhow::Result<()> {
@@ -126,6 +172,21 @@ impl ObjectStore {
             .await
             .context("get S3 object")?
             .body)
+    }
+
+    /// Delete the current object at `key`, without reference to versions.
+    ///
+    /// Used on buckets that do not have versioning enabled, where there is no
+    /// version list to enumerate.
+    pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .context("delete S3 object")?;
+        Ok(())
     }
 
     pub async fn delete_version(&self, key: &str, version_id: &str) -> anyhow::Result<()> {
@@ -370,7 +431,55 @@ fn build_client(config: &Config, endpoint: &str) -> Client {
 
 #[cfg(test)]
 mod tests {
-    use super::post_url;
+    use std::sync::Arc;
+
+    use super::{ObjectStore, post_url};
+    use crate::config::{Config, Inner};
+
+    fn config(direct_upload_enabled: bool) -> Config {
+        Config(Arc::new(Inner {
+            database_url: String::new(),
+            listen_addr: String::new(),
+            public_url: "https://threadmark.example".into(),
+            secret: "a-secret-that-is-longer-than-32-bytes".into(),
+            capability_ttl_seconds: 900,
+            file_max_bytes: 32 * 1024 * 1024,
+            s3_endpoint: "https://objects.example".into(),
+            s3_public_url: None,
+            s3_region: "us-east-1".into(),
+            s3_bucket: "threadmark".into(),
+            s3_access_key_id: "key".into(),
+            s3_secret_access_key: "secret".into(),
+            s3_force_path_style: true,
+            direct_upload_enabled,
+            file_upload_url_ttl_seconds: 60,
+            file_upload_session_ttl_seconds: 3600,
+            auth_mode: crate::config::AuthMode::Jwt,
+            auth_issuer: None,
+            auth_audience: None,
+            auth_jwks_url: None,
+            auth_max_owner_token_seconds: 300,
+        }))
+    }
+
+    #[test]
+    fn versioning_defaults_to_absent_until_probed() {
+        // `ensure_ready` has not run, so deletion must take the conservative
+        // single-object path rather than assuming versions can be enumerated.
+        assert!(!ObjectStore::new(&config(false)).is_versioned());
+        assert!(!ObjectStore::new(&config(true)).is_versioned());
+    }
+
+    #[test]
+    fn versioning_result_is_shared_with_clones() {
+        // `ensure_ready` runs once on the original before the store is cloned
+        // into the router state and the cleanup task; both must observe it.
+        let store = ObjectStore::new(&config(false));
+        let clone = store.clone();
+        store.versioned.set(true).expect("first write wins");
+        assert!(store.is_versioned());
+        assert!(clone.is_versioned());
+    }
 
     #[test]
     fn builds_path_and_virtual_host_post_urls() {

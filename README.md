@@ -108,10 +108,13 @@ cargo run
 Migrations run automatically at startup. The API listens on port `8090` by
 default, and `GET /health` checks database connectivity.
 
-The S3-compatible bucket must exist before Threadmark starts and must have
-versioning enabled. This is a global alpha storage prerequisite, including for
-the retained server-mediated `POST /v1/files` endpoint, so Threadmark can
-delete every object version safely. Compose creates and version-enables a local
+The S3-compatible bucket must exist before Threadmark starts. Bucket versioning
+is **required** when `DIRECT_UPLOAD_ENABLED=true`, because direct browser
+uploads pin the server-side copy to the exact object version Threadmark
+validated; startup fails if it is not enabled. Versioning is **recommended**
+otherwise, so that deleting a file removes every recoverable copy rather than
+just the current object. Threadmark logs a warning at startup when running
+against an unversioned bucket. Compose creates and version-enables a local
 MinIO bucket automatically. In production, configure `S3_ENDPOINT`,
 `S3_BUCKET`, credentials with `s3:GetBucketVersioning`, and optionally a
 separately reachable `S3_PUBLIC_URL` for direct presigned delivery.

@@ -40,10 +40,7 @@ async fn main() -> anyhow::Result<()> {
         .context("run migrations")?;
 
     let object_store = object_store::ObjectStore::new(&config);
-    object_store.ping().await.context("access S3 bucket")?;
-    if !object_store.versioning_enabled().await? {
-        anyhow::bail!("S3 bucket versioning must be Enabled");
-    }
+    object_store.ensure_ready().await?;
     files::cleanup_deletions(&pool, &object_store)
         .await
         .context("clean up pending file deletions")?;

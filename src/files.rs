@@ -48,7 +48,7 @@ pub async fn save(
     match inserted {
         Ok(file) => Ok(file),
         Err(error) => {
-            if let Err(cleanup_error) = delete_all_versions(objects, &storage_key).await {
+            if let Err(cleanup_error) = delete_stored_object(objects, &storage_key).await {
                 tracing::error!(?cleanup_error, %storage_key, "failed to clean up untracked object");
             }
             Err(ApiError::Database(error))
@@ -148,7 +148,7 @@ async fn delete_pending(
     file_id: &str,
     storage_key: &str,
 ) -> ApiResult<()> {
-    delete_all_versions(objects, storage_key).await?;
+    delete_stored_object(objects, storage_key).await?;
     sqlx::query("DELETE FROM file_deletion_outbox WHERE file_id = $1")
         .bind(file_id)
         .execute(pool)
@@ -156,7 +156,18 @@ async fn delete_pending(
     Ok(())
 }
 
-async fn delete_all_versions(objects: &ObjectStore, storage_key: &str) -> ApiResult<()> {
+/// Remove every trace of a stored object.
+///
+/// On a versioned bucket this enumerates and deletes each version, so a deleted
+/// file leaves no recoverable copy. On an unversioned bucket there is no version
+/// list to enumerate and a single delete removes the object.
+async fn delete_stored_object(objects: &ObjectStore, storage_key: &str) -> ApiResult<()> {
+    if !objects.is_versioned() {
+        return objects
+            .delete(storage_key)
+            .await
+            .map_err(ApiError::ObjectStore);
+    }
     for version_id in objects
         .versions(storage_key)
         .await
