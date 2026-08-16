@@ -8,6 +8,7 @@ mod ids;
 mod model;
 mod object_store;
 mod store;
+mod uploads;
 
 use anyhow::Context;
 use sqlx::postgres::PgPoolOptions;
@@ -40,9 +41,13 @@ async fn main() -> anyhow::Result<()> {
 
     let object_store = object_store::ObjectStore::new(&config);
     object_store.ping().await.context("access S3 bucket")?;
+    if !object_store.versioning_enabled().await? {
+        anyhow::bail!("S3 bucket versioning must be Enabled");
+    }
     files::cleanup_deletions(&pool, &object_store)
         .await
         .context("clean up pending file deletions")?;
+    uploads::cleanup_expired(&pool, &object_store).await?;
     let cleanup_pool = pool.clone();
     let cleanup_store = object_store.clone();
     tokio::spawn(async move {
@@ -52,6 +57,9 @@ async fn main() -> anyhow::Result<()> {
             interval.tick().await;
             if let Err(error) = files::cleanup_deletions(&cleanup_pool, &cleanup_store).await {
                 tracing::error!(?error, "file deletion outbox pass failed");
+            }
+            if let Err(error) = uploads::cleanup_expired(&cleanup_pool, &cleanup_store).await {
+                tracing::error!(?error, "expired direct-upload cleanup pass failed");
             }
         }
     });

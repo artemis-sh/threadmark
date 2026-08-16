@@ -24,7 +24,7 @@ use crate::{
         TruncateConversation, Turn, UpdateConversation, UpdateTurn, validate_json_number_tokens,
     },
     object_store::ObjectStore,
-    store,
+    store, uploads,
 };
 
 #[derive(Clone)]
@@ -74,6 +74,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/continuations/{response_id}", get(get_continuation))
         .route("/v1/files", post(upload_file))
+        .route("/v1/file-uploads", post(initiate_file_upload))
+        .route("/v1/file-uploads/{id}/complete", post(complete_file_upload))
         .route("/v1/files/{id}", get(get_file).delete(delete_file))
         .route("/v1/files/{id}/content", get(get_file_content))
         .route("/v1/files/{id}/downloads", post(create_file_download))
@@ -367,6 +369,78 @@ async fn upload_file(
         return Ok((StatusCode::CREATED, Json(file.into())));
     }
     Err(ApiError::BadRequest("Missing `file` field.".into()))
+}
+
+async fn initiate_file_upload(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Json(request): Json<uploads::InitiateRequest>,
+) -> ApiResult<Response> {
+    auth.require(Permission::FileCreate)?;
+    if auth.agent_ref().is_some() {
+        return Err(ApiError::Forbidden);
+    }
+    let (created, upload) = uploads::initiate(
+        &state.pool,
+        &state.object_store,
+        &state.config,
+        &auth,
+        request,
+    )
+    .await?;
+    let finalizing = upload.status == "finalizing";
+    let mut response = (
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(upload),
+    )
+        .into_response();
+    if finalizing {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+    }
+    Ok(response)
+}
+
+async fn complete_file_upload(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    auth.require(Permission::FileCreate)?;
+    if auth.agent_ref().is_some() {
+        return Err(ApiError::Forbidden);
+    }
+    match uploads::complete(&state.pool, &state.object_store, &state.config, &auth, &id).await {
+        Ok((created, file)) => Ok((
+            if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            Json(file),
+        )
+            .into_response()),
+        Err(ApiError::CodedConflict {
+            code: "upload_finalizing",
+            message,
+        }) => {
+            let mut response = ApiError::CodedConflict {
+                code: "upload_finalizing",
+                message,
+            }
+            .into_response();
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+            Ok(response)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn get_file(

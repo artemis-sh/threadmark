@@ -19,6 +19,9 @@ pub struct Inner {
     pub s3_access_key_id: String,
     pub s3_secret_access_key: String,
     pub s3_force_path_style: bool,
+    pub direct_upload_enabled: bool,
+    pub file_upload_url_ttl_seconds: u64,
+    pub file_upload_session_ttl_seconds: u64,
     pub auth_mode: AuthMode,
     pub auth_issuer: Option<String>,
     pub auth_audience: Option<String>,
@@ -97,6 +100,28 @@ impl Config {
             auth_max_owner_token_seconds > 0,
             "AUTH_MAX_OWNER_TOKEN_SECONDS must be greater than zero"
         );
+        let direct_upload_enabled = std::env::var("DIRECT_UPLOAD_ENABLED")
+            .unwrap_or_else(|_| "false".into())
+            .parse()
+            .context("DIRECT_UPLOAD_ENABLED must be true or false")?;
+        let file_upload_url_ttl_seconds = parse("FILE_UPLOAD_URL_TTL_SECONDS", "60")?;
+        ensure!(
+            (1..=300).contains(&file_upload_url_ttl_seconds),
+            "FILE_UPLOAD_URL_TTL_SECONDS must be from 1 through 300"
+        );
+        let file_upload_session_ttl_seconds = parse("FILE_UPLOAD_SESSION_TTL_SECONDS", "3600")?;
+        ensure!(
+            (1..=i64::MAX as u64).contains(&file_upload_session_ttl_seconds),
+            "FILE_UPLOAD_SESSION_TTL_SECONDS must be from 1 through i64::MAX"
+        );
+        if direct_upload_enabled {
+            ensure!(
+                std::env::var("S3_PUBLIC_URL")
+                    .ok()
+                    .is_some_and(|value| !value.is_empty()),
+                "DIRECT_UPLOAD_ENABLED requires S3_PUBLIC_URL"
+            );
+        }
         #[cfg(feature = "trusted-headers")]
         if auth_mode == AuthMode::TrustedHeaders {
             tracing::warn!("trusted-header authentication is enabled; do not expose this service");
@@ -121,6 +146,9 @@ impl Config {
                 .unwrap_or_else(|_| "true".into())
                 .parse()
                 .context("S3_FORCE_PATH_STYLE must be true or false")?,
+            direct_upload_enabled,
+            file_upload_url_ttl_seconds,
+            file_upload_session_ttl_seconds,
             auth_mode,
             auth_issuer,
             auth_audience,
