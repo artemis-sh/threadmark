@@ -40,6 +40,21 @@ async fn main() -> anyhow::Result<()> {
 
     let object_store = object_store::ObjectStore::new(&config);
     object_store.ping().await.context("access S3 bucket")?;
+    files::cleanup_deletions(&pool, &object_store)
+        .await
+        .context("clean up pending file deletions")?;
+    let cleanup_pool = pool.clone();
+    let cleanup_store = object_store.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(error) = files::cleanup_deletions(&cleanup_pool, &cleanup_store).await {
+                tracing::error!(?error, "file deletion outbox pass failed");
+            }
+        }
+    });
 
     let listener = TcpListener::bind(&config.listen_addr)
         .await

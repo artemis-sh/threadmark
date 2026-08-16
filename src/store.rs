@@ -1,5 +1,7 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
+use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::{
@@ -10,10 +12,74 @@ use crate::{
     ids::new_id,
     model::{
         Actor, AppendItems, AppendResult, Continuation, Conversation, CreateContinuation,
-        CreateConversation, CreateTurn, FileDelivery, Item, ReplayRequest, ReplayResult, Turn,
-        UpdateConversation, UpdateTurn,
+        CreateConversation, CreateTurn, FileDelivery, Item, ReplayRequest, ReplayResult, StartTurn,
+        StartTurnResult, Turn, UpdateConversation, UpdateTurn,
     },
 };
+
+#[derive(Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum TurnStartDigest<'a> {
+    Existing {
+        operation: &'static str,
+        version: i16,
+        conversation_id: &'a str,
+        agent_ref: &'a str,
+        items: &'a [Value],
+    },
+    Create {
+        operation: &'static str,
+        version: i16,
+        conversation: &'a CreateConversation,
+        agent_ref: &'a str,
+        items: &'a [Value],
+    },
+}
+
+fn coded_conflict(code: &'static str, message: &str) -> ApiError {
+    ApiError::CodedConflict {
+        code,
+        message: message.into(),
+    }
+}
+
+fn normalize_title(value: Option<&str>) -> ApiResult<String> {
+    let title = value.unwrap_or("New conversation").trim();
+    if title.is_empty() || title.chars().count() > 200 {
+        return Err(ApiError::BadRequest(
+            "title must contain 1 to 200 characters".into(),
+        ));
+    }
+    Ok(title.to_owned())
+}
+
+fn turn_start_digest_v1(request: &StartTurn) -> ApiResult<Vec<u8>> {
+    let digest_input = match (
+        request.conversation_id.as_deref(),
+        request.conversation.as_ref(),
+    ) {
+        (Some(conversation_id), None) => TurnStartDigest::Existing {
+            operation: "turn_start",
+            version: 1,
+            conversation_id,
+            agent_ref: &request.agent_ref,
+            items: &request.items,
+        },
+        (None, Some(conversation)) => TurnStartDigest::Create {
+            operation: "turn_start",
+            version: 1,
+            conversation,
+            agent_ref: &request.agent_ref,
+            items: &request.items,
+        },
+        _ => unreachable!("conversation mode validated"),
+    };
+    Ok(Sha256::digest(
+        serde_json_canonicalizer::to_vec(&digest_input)
+            .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?,
+    )
+    .to_vec())
+}
 
 pub async fn create_conversation(
     pool: &PgPool,
@@ -25,12 +91,7 @@ pub async fn create_conversation(
             "metadata must be a JSON object".into(),
         ));
     }
-    let title = request.title.unwrap_or_else(|| "New conversation".into());
-    if title.trim().is_empty() || title.len() > 200 {
-        return Err(ApiError::BadRequest(
-            "title must contain 1 to 200 characters".into(),
-        ));
-    }
+    let title = normalize_title(request.title.as_deref())?;
     Ok(sqlx::query_as::<_, Conversation>(
         "INSERT INTO conversations (id, tenant_id, owner_ref, title, metadata)
          VALUES ($1, $2, $3, $4, $5) RETURNING *",
@@ -38,7 +99,7 @@ pub async fn create_conversation(
     .bind(new_id("conv"))
     .bind(&actor.tenant_id)
     .bind(&actor.principal_id)
-    .bind(title.trim())
+    .bind(title)
     .bind(request.metadata)
     .fetch_one(pool)
     .await?)
@@ -83,13 +144,11 @@ pub async fn update_conversation(
             "No conversation changes supplied.".into(),
         ));
     }
-    if let Some(title) = &request.title
-        && (title.trim().is_empty() || title.len() > 200)
-    {
-        return Err(ApiError::BadRequest(
-            "title must contain 1 to 200 characters".into(),
-        ));
-    }
+    let title = request
+        .title
+        .as_deref()
+        .map(|title| normalize_title(Some(title)))
+        .transpose()?;
     if let Some(metadata) = &request.metadata
         && !metadata.is_object()
     {
@@ -103,7 +162,7 @@ pub async fn update_conversation(
             updated_at = now()
          WHERE id = $3 AND tenant_id = $4 AND owner_ref = $5 RETURNING *",
     )
-    .bind(request.title.map(|title| title.trim().to_owned()))
+    .bind(title)
     .bind(request.metadata)
     .bind(id)
     .bind(&actor.tenant_id)
@@ -164,6 +223,428 @@ async fn lock_conversation<'a>(
     .ok_or_else(|| ApiError::NotFound("Conversation not found.".into()))
 }
 
+async fn create_turn_file_snapshot(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: &str,
+    turn_id: &str,
+) -> ApiResult<()> {
+    let snapshot_id = new_id("fsnap");
+    sqlx::query(
+        "INSERT INTO turn_file_snapshots (id, turn_id, authoritative)
+         VALUES ($1, $2, true)",
+    )
+    .bind(&snapshot_id)
+    .bind(turn_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO turn_file_snapshot_files (snapshot_id, file_id)
+         SELECT $1, item_file.file_id
+         FROM conversation_item_files item_file
+         JOIN conversation_items item ON item.id = item_file.item_id
+         WHERE item.conversation_id = $2
+         GROUP BY item_file.file_id",
+    )
+    .bind(snapshot_id)
+    .bind(conversation_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn lock_turn_files(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &Actor,
+    conversation_id: &str,
+    additional_file_ids: &[String],
+) -> ApiResult<()> {
+    let file_ids = sqlx::query_scalar::<_, String>(
+        "SELECT file.id
+         FROM files file
+         WHERE file.id IN (
+             SELECT item_file.file_id
+             FROM conversation_item_files item_file
+             JOIN conversation_items item ON item.id = item_file.item_id
+             WHERE item.conversation_id = $1
+             UNION
+             SELECT unnest($2::text[])
+         )
+         AND file.tenant_id = $3 AND file.owner_ref = $4
+         ORDER BY file.id
+         FOR KEY SHARE",
+    )
+    .bind(conversation_id)
+    .bind(additional_file_ids)
+    .bind(&actor.tenant_id)
+    .bind(&actor.principal_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let expected = sqlx::query_scalar::<_, i64>(
+        "SELECT count(DISTINCT file_id)
+         FROM (
+             SELECT item_file.file_id
+             FROM conversation_item_files item_file
+             JOIN conversation_items item ON item.id = item_file.item_id
+             WHERE item.conversation_id = $1
+             UNION
+             SELECT unnest($2::text[])
+         ) referenced_files",
+    )
+    .bind(conversation_id)
+    .bind(additional_file_ids)
+    .fetch_one(&mut **tx)
+    .await?;
+    if file_ids.len() != expected as usize {
+        return Err(ApiError::NotFound("File not found.".into()));
+    }
+    Ok(())
+}
+
+pub async fn start_turn(
+    pool: &PgPool,
+    auth: &crate::auth::AuthContext,
+    mut request: StartTurn,
+) -> ApiResult<StartTurnResult> {
+    request.idempotency_key = request.idempotency_key.trim().to_owned();
+    request.agent_ref = request.agent_ref.trim().to_owned();
+    if request.idempotency_key.is_empty() || request.idempotency_key.chars().count() > 200 {
+        return Err(ApiError::BadRequest(
+            "idempotency_key must contain 1 to 200 characters".into(),
+        ));
+    }
+    if request.agent_ref.is_empty() || request.agent_ref.chars().count() > 200 {
+        return Err(ApiError::BadRequest(
+            "agent_ref must contain 1 to 200 characters".into(),
+        ));
+    }
+    if request.conversation_id.is_some() == request.conversation.is_some() {
+        return Err(ApiError::BadRequest(
+            "exactly one of conversation_id and conversation is required".into(),
+        ));
+    }
+    if request.items.is_empty() || request.items.len() > 100 {
+        return Err(ApiError::BadRequest(
+            "items must contain between 1 and 100 entries".into(),
+        ));
+    }
+    if request.items.iter().any(|item| !item.is_object()) {
+        return Err(ApiError::BadRequest(
+            "each item must be a JSON object".into(),
+        ));
+    }
+    if let Some(conversation) = &mut request.conversation {
+        if !conversation.metadata.is_object() {
+            return Err(ApiError::BadRequest(
+                "metadata must be a JSON object".into(),
+            ));
+        }
+        conversation.title = Some(normalize_title(conversation.title.as_deref())?);
+    }
+
+    let request_digest = turn_start_digest_v1(&request)?;
+    let lock_key = turn_start_lock_key(
+        &auth.tenant_id,
+        &auth.principal_id,
+        &auth.client_id,
+        &request.idempotency_key,
+    );
+
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(lock_key)
+        .execute(&mut *tx)
+        .await?;
+
+    if let Some((
+        turn_start_id,
+        request_version,
+        stored_digest,
+        conversation_id,
+        turn_id,
+        first_seq,
+        last_seq,
+    )) = sqlx::query_as::<_, (String, i16, Vec<u8>, String, String, i64, i64)>(
+        "SELECT id, request_version, request_digest, conversation_id, turn_id, first_seq, last_seq
+             FROM turn_starts
+             WHERE tenant_id = $1 AND owner_ref = $2 AND client_id = $3
+               AND idempotency_key = $4",
+    )
+    .bind(&auth.tenant_id)
+    .bind(&auth.principal_id)
+    .bind(&auth.client_id)
+    .bind(&request.idempotency_key)
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        let request_digest = match request_version {
+            1 => turn_start_digest_v1(&request)?,
+            _ => {
+                return Err(coded_conflict(
+                    "idempotency_version_unsupported",
+                    "the original request version is not supported by this server",
+                ));
+            }
+        };
+        if stored_digest != request_digest {
+            if let Some(conversation_id) = &request.conversation_id {
+                let owned = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM conversations
+                     WHERE id = $1 AND tenant_id = $2 AND owner_ref = $3)",
+                )
+                .bind(conversation_id)
+                .bind(&auth.tenant_id)
+                .bind(&auth.principal_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if !owned {
+                    return Err(ApiError::NotFound("Conversation not found.".into()));
+                }
+            }
+            return Err(coded_conflict(
+                "idempotency_key_reused",
+                "idempotency_key was already used for a different request",
+            ));
+        }
+        let conversation_exists = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM conversations
+             WHERE id = $1 AND tenant_id = $2 AND owner_ref = $3 FOR UPDATE",
+        )
+        .bind(&conversation_id)
+        .bind(&auth.tenant_id)
+        .bind(&auth.principal_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        let children = sqlx::query_as::<_, (i32, String, i64, Option<String>)>(
+            "SELECT tsi.ordinal, tsi.item_id, tsi.seq, i.id
+             FROM turn_start_items tsi
+             LEFT JOIN conversation_items i ON i.id = tsi.item_id
+               AND i.conversation_id = $2 AND i.turn_id = $3 AND i.seq = tsi.seq
+             WHERE tsi.turn_start_id = $1
+             ORDER BY tsi.ordinal",
+        )
+        .bind(&turn_start_id)
+        .bind(&conversation_id)
+        .bind(&turn_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let expected_count = last_seq - first_seq + 1;
+        let valid_children = expected_count > 0
+            && children.len() == expected_count as usize
+            && children.iter().enumerate().all(|(index, child)| {
+                child.0 == index as i32
+                    && child.2 == first_seq + index as i64
+                    && child.3.as_deref() == Some(child.1.as_str())
+            });
+        if !conversation_exists || !valid_children {
+            return Err(coded_conflict(
+                "idempotency_result_deleted",
+                "the original turn start result is no longer available",
+            ));
+        }
+        let item_ids = children
+            .into_iter()
+            .map(|(_, item_id, _, _)| item_id)
+            .collect();
+        tx.commit().await?;
+        return Ok(StartTurnResult {
+            conversation_id,
+            turn_id,
+            item_ids,
+            first_seq,
+            last_seq,
+            replayed: true,
+        });
+    }
+
+    let conversation = if let Some(conversation_id) = &request.conversation_id {
+        lock_conversation(&mut tx, auth, conversation_id).await?
+    } else {
+        let conversation = request
+            .conversation
+            .as_ref()
+            .expect("validated conversation");
+        sqlx::query_as::<_, Conversation>(
+            "INSERT INTO conversations (id, tenant_id, owner_ref, title, metadata)
+             VALUES ($1, $2, $3, $4, $5) RETURNING *",
+        )
+        .bind(new_id("conv"))
+        .bind(&auth.tenant_id)
+        .bind(&auth.principal_id)
+        .bind(conversation.title.as_deref().expect("normalized title"))
+        .bind(&conversation.metadata)
+        .fetch_one(&mut *tx)
+        .await?
+    };
+
+    let active_turn_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM turns WHERE conversation_id = $1
+         AND status IN ('pending', 'streaming'))",
+    )
+    .bind(&conversation.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if active_turn_exists {
+        return Err(coded_conflict(
+            "active_turn_exists",
+            "conversation already has an active turn",
+        ));
+    }
+
+    let mut file_ids = request
+        .items
+        .iter()
+        .flat_map(referenced_file_ids)
+        .collect::<Vec<_>>();
+    file_ids.sort();
+    file_ids.dedup();
+    lock_turn_files(&mut tx, auth, &conversation.id, &file_ids).await?;
+
+    let turn_id = new_id("turn");
+    let turn_insert = sqlx::query(
+        "INSERT INTO turns (id, conversation_id, agent_ref, idempotency_key)
+         VALUES ($1, $2, $3, NULL)",
+    )
+    .bind(&turn_id)
+    .bind(&conversation.id)
+    .bind(&request.agent_ref)
+    .execute(&mut *tx)
+    .await;
+    if let Err(error) = turn_insert {
+        if error
+            .as_database_error()
+            .and_then(|error| error.constraint())
+            == Some("turns_one_active_per_conversation_idx")
+        {
+            return Err(coded_conflict(
+                "active_turn_exists",
+                "conversation already has an active turn",
+            ));
+        }
+        return Err(error.into());
+    }
+    create_turn_file_snapshot(&mut tx, &conversation.id, &turn_id).await?;
+
+    let item_count = i64::try_from(request.items.len())
+        .map_err(|_| coded_conflict("sequence_space_exhausted", "sequence space exhausted"))?;
+    let next_seq = conversation
+        .next_seq
+        .checked_add(item_count)
+        .ok_or_else(|| coded_conflict("sequence_space_exhausted", "sequence space exhausted"))?;
+    let first_seq = conversation.next_seq;
+    let last_seq = next_seq - 1;
+    let mut item_ids = Vec::with_capacity(request.items.len());
+    for (offset, payload) in request.items.into_iter().enumerate() {
+        let file_ids = referenced_file_ids(&payload);
+        let item_id = new_id("item");
+        sqlx::query(
+            "INSERT INTO conversation_items
+             (id, conversation_id, turn_id, seq, source, payload)
+             VALUES ($1, $2, $3, $4, 'user', $5)",
+        )
+        .bind(&item_id)
+        .bind(&conversation.id)
+        .bind(&turn_id)
+        .bind(first_seq + offset as i64)
+        .bind(payload)
+        .execute(&mut *tx)
+        .await?;
+        for file_id in file_ids {
+            sqlx::query(
+                "INSERT INTO conversation_item_files (item_id, file_id)
+                 VALUES ($1, $2)",
+            )
+            .bind(&item_id)
+            .bind(file_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        item_ids.push(item_id);
+    }
+    sqlx::query("UPDATE conversations SET next_seq = $2, updated_at = now() WHERE id = $1")
+        .bind(&conversation.id)
+        .bind(next_seq)
+        .execute(&mut *tx)
+        .await?;
+
+    let turn_start_id = new_id("tstart");
+    sqlx::query(
+        "INSERT INTO turn_starts
+         (id, tenant_id, owner_ref, client_id, idempotency_key, request_version,
+          request_digest, conversation_id, turn_id, first_seq, last_seq)
+         VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9, $10)",
+    )
+    .bind(&turn_start_id)
+    .bind(&auth.tenant_id)
+    .bind(&auth.principal_id)
+    .bind(&auth.client_id)
+    .bind(&request.idempotency_key)
+    .bind(request_digest)
+    .bind(&conversation.id)
+    .bind(&turn_id)
+    .bind(first_seq)
+    .bind(last_seq)
+    .execute(&mut *tx)
+    .await?;
+    for (ordinal, item_id) in item_ids.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO turn_start_items (turn_start_id, ordinal, item_id, seq)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(&turn_start_id)
+        .bind(ordinal as i32)
+        .bind(item_id)
+        .bind(first_seq + ordinal as i64)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+
+    Ok(StartTurnResult {
+        conversation_id: conversation.id,
+        turn_id,
+        item_ids,
+        first_seq,
+        last_seq,
+        replayed: false,
+    })
+}
+
+fn turn_start_lock_key(tenant: &str, owner: &str, client: &str, key: &str) -> i64 {
+    let mut digest = Sha256::new();
+    digest.update(b"threadmark:turn-start-lock:v1\0");
+    for value in [tenant, owner, client, key] {
+        digest.update((value.len() as u32).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    i64::from_be_bytes(
+        digest.finalize()[..8]
+            .try_into()
+            .expect("eight digest bytes"),
+    )
+}
+
+#[cfg(test)]
+mod turn_start_tests {
+    use super::turn_start_lock_key;
+
+    #[test]
+    fn turn_start_lock_key_is_stable_and_framed() {
+        assert_eq!(
+            turn_start_lock_key("tenant", "owner", "client", "request"),
+            turn_start_lock_key("tenant", "owner", "client", "request")
+        );
+        assert_ne!(
+            turn_start_lock_key("ab", "c", "client", "request"),
+            turn_start_lock_key("a", "bc", "client", "request")
+        );
+        assert_ne!(
+            turn_start_lock_key("tenant", "owner", "client-a", "request"),
+            turn_start_lock_key("tenant", "owner", "client-b", "request")
+        );
+    }
+}
+
 pub async fn append_items(
     pool: &PgPool,
     actor: &Actor,
@@ -190,12 +671,6 @@ pub async fn append_items(
             "each item must be a JSON object".into(),
         ));
     }
-    for payload in &request.items {
-        for file_id in referenced_file_ids(payload) {
-            files::get_owned(pool, actor, &file_id).await?;
-        }
-    }
-
     let mut tx = pool.begin().await?;
     let conversation = lock_conversation(&mut tx, actor, conversation_id).await?;
     if let Some((first_seq, last_seq)) = sqlx::query_as::<_, (i64, i64)>(
@@ -238,10 +713,34 @@ pub async fn append_items(
         }
     }
 
+    let mut file_ids = request
+        .items
+        .iter()
+        .flat_map(referenced_file_ids)
+        .collect::<Vec<_>>();
+    file_ids.sort();
+    file_ids.dedup();
+    for file_id in &file_ids {
+        let exists = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM files
+             WHERE id = $1 AND tenant_id = $2 AND owner_ref = $3 FOR KEY SHARE",
+        )
+        .bind(file_id)
+        .bind(&actor.tenant_id)
+        .bind(&actor.principal_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        if !exists {
+            return Err(ApiError::NotFound("File not found.".into()));
+        }
+    }
+
     let first_seq = conversation.next_seq;
     let last_seq = first_seq + request.items.len() as i64 - 1;
     let mut inserted = Vec::with_capacity(request.items.len());
     for (offset, payload) in request.items.into_iter().enumerate() {
+        let file_ids = referenced_file_ids(&payload);
         inserted.push(
             sqlx::query_as::<_, Item>(
                 "INSERT INTO conversation_items
@@ -257,6 +756,17 @@ pub async fn append_items(
             .fetch_one(&mut *tx)
             .await?,
         );
+        let item_id = &inserted.last().expect("item was inserted").id;
+        for file_id in file_ids {
+            sqlx::query(
+                "INSERT INTO conversation_item_files (item_id, file_id)
+                 VALUES ($1, $2)",
+            )
+            .bind(item_id)
+            .bind(file_id)
+            .execute(&mut *tx)
+            .await?;
+        }
     }
     sqlx::query(
         "INSERT INTO append_batches (conversation_id, idempotency_key, first_seq, last_seq)
@@ -452,24 +962,78 @@ pub async fn create_turn(
     conversation_id: &str,
     request: CreateTurn,
 ) -> ApiResult<Turn> {
-    get_conversation(pool, actor, conversation_id).await?;
-    if request.agent_ref.trim().is_empty() || request.idempotency_key.trim().is_empty() {
+    let agent_ref = request.agent_ref.trim();
+    let idempotency_key = request.idempotency_key.as_str();
+    let mut tx = pool.begin().await?;
+    lock_conversation(&mut tx, actor, conversation_id).await?;
+    if let Some(turn) = sqlx::query_as::<_, Turn>(
+        "SELECT * FROM turns WHERE conversation_id = $1 AND idempotency_key = $2",
+    )
+    .bind(conversation_id)
+    .bind(idempotency_key)
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        if turn.agent_ref != request.agent_ref && turn.agent_ref != agent_ref {
+            return Err(coded_conflict(
+                "idempotency_key_reused",
+                "idempotency_key was already used for a different agent",
+            ));
+        }
+        tx.commit().await?;
+        return Ok(turn);
+    }
+    if agent_ref.is_empty()
+        || agent_ref.chars().count() > 200
+        || idempotency_key.trim().is_empty()
+        || idempotency_key.chars().count() > 200
+    {
         return Err(ApiError::BadRequest(
-            "agent_ref and idempotency_key are required".into(),
+            "agent_ref and idempotency_key must contain 1 to 200 characters".into(),
         ));
     }
-    Ok(sqlx::query_as::<_, Turn>(
+    let active = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM turns WHERE conversation_id = $1
+         AND status IN ('pending', 'streaming'))",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if active {
+        return Err(coded_conflict(
+            "active_turn_exists",
+            "conversation already has an active turn",
+        ));
+    }
+    lock_turn_files(&mut tx, actor, conversation_id, &[]).await?;
+    let turn = sqlx::query_as::<_, Turn>(
         "INSERT INTO turns (id, conversation_id, agent_ref, idempotency_key)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (conversation_id, idempotency_key) DO UPDATE
-         SET idempotency_key = EXCLUDED.idempotency_key RETURNING *",
+         VALUES ($1, $2, $3, $4) RETURNING *",
     )
     .bind(new_id("turn"))
     .bind(conversation_id)
-    .bind(request.agent_ref)
-    .bind(request.idempotency_key)
-    .fetch_one(pool)
-    .await?)
+    .bind(agent_ref)
+    .bind(idempotency_key)
+    .fetch_one(&mut *tx)
+    .await;
+    let turn = match turn {
+        Ok(turn) => turn,
+        Err(error)
+            if error
+                .as_database_error()
+                .and_then(|error| error.constraint())
+                == Some("turns_one_active_per_conversation_idx") =>
+        {
+            return Err(coded_conflict(
+                "active_turn_exists",
+                "conversation already has an active turn",
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    create_turn_file_snapshot(&mut tx, conversation_id, &turn.id).await?;
+    tx.commit().await?;
+    Ok(turn)
 }
 
 pub async fn list_turns(

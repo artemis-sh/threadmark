@@ -228,6 +228,7 @@ GET /v1/continuations/resp_abc?agent_ref=research-agent%2Fprod
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/v1/conversations` | Create a conversation |
+| `POST` | `/v1/turn-starts` | Atomically create a conversation if needed, turn, and user items |
 | `GET` | `/v1/conversations/{id}` | Read conversation metadata |
 | `GET` | `/v1/conversations/{id}/items` | Read ordered items after a sequence cursor |
 | `POST` | `/v1/conversations/{id}/items` | Atomically append an idempotent item batch |

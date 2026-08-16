@@ -17,6 +17,8 @@ pub enum ApiError {
     NotFound(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("{message}")]
+    CodedConflict { code: &'static str, message: String },
     #[error("{0}")]
     PayloadTooLarge(String),
     #[error("object storage operation failed")]
@@ -33,6 +35,7 @@ impl IntoResponse for ApiError {
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
             Self::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
+            Self::CodedConflict { code, .. } => (StatusCode::CONFLICT, *code),
             Self::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
             Self::ObjectStore(error) => {
                 tracing::error!(?error, "object storage request failed");
