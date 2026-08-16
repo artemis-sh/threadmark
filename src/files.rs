@@ -117,10 +117,11 @@ where
         id: &str,
     ) -> ApiResult<()> {
         let mut tx = self.begin_write().await?;
-        let file = sqlx::query_as::<DB, FileRecord>(
+        let file = sqlx::query_as::<DB, FileRecord>(&format!(
             "SELECT * FROM files
-             WHERE id = $1 AND tenant_id = $2 AND owner_ref = $3 FOR UPDATE",
-        )
+             WHERE id = $1 AND tenant_id = $2 AND owner_ref = $3{}",
+            DB::FOR_UPDATE
+        ))
         .bind(id)
         .bind(&actor.tenant_id)
         .bind(&actor.principal_id)

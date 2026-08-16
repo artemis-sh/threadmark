@@ -327,10 +327,11 @@ where
         actor: &Actor,
         id: &str,
     ) -> ApiResult<Conversation> {
-        sqlx::query_as::<DB, Conversation>(
+        sqlx::query_as::<DB, Conversation>(&format!(
             "SELECT * FROM conversations
-             WHERE id = $1 AND tenant_id = $2 AND owner_ref = $3 FOR UPDATE",
-        )
+             WHERE id = $1 AND tenant_id = $2 AND owner_ref = $3{}",
+            DB::FOR_UPDATE
+        ))
         .bind(id)
         .bind(&actor.tenant_id)
         .bind(&actor.principal_id)
@@ -533,10 +534,11 @@ where
                     "idempotency_key was already used for a different request",
                 ));
             }
-            let conversation_exists = sqlx::query_scalar::<DB, String>(
+            let conversation_exists = sqlx::query_scalar::<DB, String>(&format!(
                 "SELECT id FROM conversations
-                 WHERE id = $1 AND tenant_id = $2 AND owner_ref = $3 FOR UPDATE",
-            )
+                 WHERE id = $1 AND tenant_id = $2 AND owner_ref = $3{}",
+                DB::FOR_UPDATE
+            ))
             .bind(&conversation_id)
             .bind(&auth.tenant_id)
             .bind(&auth.principal_id)
@@ -816,10 +818,11 @@ where
         file_ids.sort();
         file_ids.dedup();
         for file_id in &file_ids {
-            let exists = sqlx::query_scalar::<DB, String>(
+            let exists = sqlx::query_scalar::<DB, String>(&format!(
                 "SELECT id FROM files
-                 WHERE id = $1 AND tenant_id = $2 AND owner_ref = $3 FOR KEY SHARE",
-            )
+                 WHERE id = $1 AND tenant_id = $2 AND owner_ref = $3{}",
+                DB::FOR_KEY_SHARE
+            ))
             .bind(file_id)
             .bind(&actor.tenant_id)
             .bind(&actor.principal_id)
@@ -873,13 +876,12 @@ where
         .bind(last_seq)
         .execute(&mut *tx)
         .await?;
-        sqlx::query::<DB>(
-            "UPDATE conversations SET next_seq = $2, updated_at = now() WHERE id = $1",
-        )
-        .bind(conversation_id)
-        .bind(last_seq + 1)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query::<DB>("UPDATE conversations SET next_seq = $2, updated_at = $3 WHERE id = $1")
+            .bind(conversation_id)
+            .bind(last_seq + 1)
+            .bind(Utc::now())
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(AppendResult {
             items: inserted,
@@ -1175,13 +1177,12 @@ where
         .bind(seq)
         .execute(&mut *tx)
         .await?;
-        sqlx::query::<DB>(
-            "UPDATE conversations SET next_seq = $2, updated_at = now() WHERE id = $1",
-        )
-        .bind(conversation_id)
-        .bind(seq)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query::<DB>("UPDATE conversations SET next_seq = $2, updated_at = $3 WHERE id = $1")
+            .bind(conversation_id)
+            .bind(seq)
+            .bind(Utc::now())
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
