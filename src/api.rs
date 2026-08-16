@@ -7,7 +7,6 @@ use axum::{
     routing::{get, post},
 };
 use serde::Deserialize;
-use sqlx::PgPool;
 use tower_http::trace::TraceLayer;
 
 use crate::{
@@ -15,7 +14,6 @@ use crate::{
     capability,
     config::Config,
     error::{ApiError, ApiResult},
-    files,
     model::{
         Actor, AppendItems, AppendResult, Continuation, ContinuationQuery, Conversation,
         CreateContinuation, CreateConversation, CreateDownload, CreateTurn, DownloadDelivery,
@@ -24,12 +22,12 @@ use crate::{
         TruncateConversation, Turn, UpdateConversation, UpdateTurn, validate_json_number_tokens,
     },
     object_store::ObjectStore,
-    store, uploads,
+    uploads,
 };
 
 #[derive(Clone)]
 pub struct AppState {
-    pub pool: PgPool,
+    pub store: crate::store::Stores,
     pub object_store: ObjectStore,
     pub config: Config,
     pub auth: Authenticator,
@@ -88,9 +86,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn health(State(state): State<AppState>) -> ApiResult<StatusCode> {
-    sqlx::query_scalar::<_, i32>("SELECT 1")
-        .fetch_one(&state.pool)
-        .await?;
+    state.store.ping().await?;
     state
         .object_store
         .ping()
@@ -107,7 +103,7 @@ async fn create_conversation(
     auth.require(Permission::ConversationCreate)?;
     Ok((
         StatusCode::CREATED,
-        Json(store::create_conversation(&state.pool, &auth, request).await?),
+        Json(state.store.create_conversation(&auth, request).await?),
     ))
 }
 
@@ -123,7 +119,7 @@ async fn start_turn(
     if request.conversation.is_some() {
         auth.require(Permission::ConversationCreate)?;
     }
-    let result = store::start_turn(&state.pool, &auth, request).await?;
+    let result = state.store.start_turn(&auth, request).await?;
     let status = if result.replayed {
         StatusCode::OK
     } else {
@@ -152,7 +148,10 @@ async fn list_conversations(
 ) -> ApiResult<Json<Vec<Conversation>>> {
     auth.require(Permission::ConversationList)?;
     Ok(Json(
-        store::list_conversations(&state.pool, &auth, query.limit.unwrap_or(200)).await?,
+        state
+            .store
+            .list_conversations(&auth, query.limit.unwrap_or(200))
+            .await?,
     ))
 }
 
@@ -162,9 +161,7 @@ async fn get_conversation(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Conversation>> {
     auth.require(Permission::ConversationRead)?;
-    Ok(Json(
-        store::get_conversation(&state.pool, &auth, &id).await?,
-    ))
+    Ok(Json(state.store.get_conversation(&auth, &id).await?))
 }
 
 async fn update_conversation(
@@ -175,7 +172,7 @@ async fn update_conversation(
 ) -> ApiResult<Json<Conversation>> {
     auth.require(Permission::ConversationUpdate)?;
     Ok(Json(
-        store::update_conversation(&state.pool, &auth, &id, request).await?,
+        state.store.update_conversation(&auth, &id, request).await?,
     ))
 }
 
@@ -185,7 +182,7 @@ async fn delete_conversation(
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     auth.require(Permission::ConversationDelete)?;
-    store::delete_conversation(&state.pool, &auth, &id).await?;
+    state.store.delete_conversation(&auth, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -197,14 +194,10 @@ async fn list_items(
 ) -> ApiResult<Json<Vec<Item>>> {
     auth.require(Permission::TranscriptRead)?;
     Ok(Json(
-        store::list_items(
-            &state.pool,
-            &auth,
-            &id,
-            query.after_seq,
-            query.limit.unwrap_or(100),
-        )
-        .await?,
+        state
+            .store
+            .list_items(&auth, &id, query.after_seq, query.limit.unwrap_or(100))
+            .await?,
     ))
 }
 
@@ -215,9 +208,7 @@ async fn append_items(
     Json(request): Json<AppendItems>,
 ) -> ApiResult<Json<AppendResult>> {
     auth.require(Permission::TranscriptAppend)?;
-    Ok(Json(
-        store::append_items(&state.pool, &auth, &id, request).await?,
-    ))
+    Ok(Json(state.store.append_items(&auth, &id, request).await?))
 }
 
 async fn replay(
@@ -230,7 +221,12 @@ async fn replay(
     if request.file_delivery != crate::model::FileDelivery::Preserve {
         auth.require(Permission::FileRead)?;
     }
-    Ok(Json(store::replay(&state, &auth, &id, request).await?))
+    Ok(Json(
+        state
+            .store
+            .replay(&state.object_store, &state.config, &auth, &id, request)
+            .await?,
+    ))
 }
 
 async fn create_turn(
@@ -243,7 +239,7 @@ async fn create_turn(
     auth.require_agent(request.agent_ref.trim())?;
     Ok((
         StatusCode::CREATED,
-        Json(store::create_turn(&state.pool, &auth, &id, request).await?),
+        Json(state.store.create_turn(&auth, &id, request).await?),
     ))
 }
 
@@ -253,7 +249,7 @@ async fn list_turns(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Vec<Turn>>> {
     auth.require(Permission::TurnRead)?;
-    Ok(Json(store::list_turns(&state.pool, &auth, &id).await?))
+    Ok(Json(state.store.list_turns(&auth, &id).await?))
 }
 
 async fn get_active_turn(
@@ -263,7 +259,7 @@ async fn get_active_turn(
 ) -> ApiResult<Json<Option<Turn>>> {
     auth.require(Permission::ConversationRead)?;
     auth.require(Permission::TurnRead)?;
-    Ok(Json(store::active_turn(&state.pool, &auth, &id).await?))
+    Ok(Json(state.store.active_turn(&auth, &id).await?))
 }
 
 async fn get_turn(
@@ -272,7 +268,7 @@ async fn get_turn(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Turn>> {
     auth.require(Permission::TurnRead)?;
-    Ok(Json(store::get_turn(&state.pool, &auth, &id).await?))
+    Ok(Json(state.store.get_turn(&auth, &id).await?))
 }
 
 async fn update_turn(
@@ -282,9 +278,7 @@ async fn update_turn(
     Json(request): Json<UpdateTurn>,
 ) -> ApiResult<Json<Turn>> {
     auth.require(Permission::TurnUpdate)?;
-    Ok(Json(
-        store::update_turn(&state.pool, &auth, &id, request).await?,
-    ))
+    Ok(Json(state.store.update_turn(&auth, &id, request).await?))
 }
 
 async fn create_continuation(
@@ -296,7 +290,7 @@ async fn create_continuation(
     auth.require(Permission::ContinuationWrite)?;
     Ok((
         StatusCode::CREATED,
-        Json(store::create_continuation(&state.pool, &auth, &id, request).await?),
+        Json(state.store.create_continuation(&auth, &id, request).await?),
     ))
 }
 
@@ -308,7 +302,10 @@ async fn get_continuation(
 ) -> ApiResult<Json<Continuation>> {
     auth.require(Permission::ContinuationRead)?;
     Ok(Json(
-        store::get_continuation(&state.pool, &auth, &response_id, &query.agent_ref).await?,
+        state
+            .store
+            .get_continuation(&auth, &response_id, &query.agent_ref)
+            .await?,
     ))
 }
 
@@ -319,7 +316,10 @@ async fn truncate_conversation(
     Json(request): Json<TruncateConversation>,
 ) -> ApiResult<StatusCode> {
     auth.require(Permission::ConversationTruncate)?;
-    store::truncate_conversation(&state.pool, &auth, &id, &request.item_id).await?;
+    state
+        .store
+        .truncate_conversation(&auth, &id, &request.item_id)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -330,7 +330,7 @@ async fn regenerate_conversation(
 ) -> ApiResult<Json<RegenerateResult>> {
     auth.require(Permission::ConversationRegenerate)?;
     Ok(Json(RegenerateResult {
-        turn_id: store::regenerate_conversation(&state.pool, &auth, &id).await?,
+        turn_id: state.store.regenerate_conversation(&auth, &id).await?,
     }))
 }
 
@@ -356,16 +356,17 @@ async fn upload_file(
         let bytes = field.bytes().await.map_err(|error| {
             ApiError::BadRequest(format!("Could not read multipart file: {error}"))
         })?;
-        let file = files::save(
-            &state.pool,
-            &state.object_store,
-            &auth,
-            &filename,
-            &mime_type,
-            bytes,
-            state.config.file_max_bytes,
-        )
-        .await?;
+        let file = state
+            .store
+            .save_file(
+                &state.object_store,
+                &auth,
+                &filename,
+                &mime_type,
+                bytes,
+                state.config.file_max_bytes,
+            )
+            .await?;
         return Ok((StatusCode::CREATED, Json(file.into())));
     }
     Err(ApiError::BadRequest("Missing `file` field.".into()))
@@ -380,14 +381,10 @@ async fn initiate_file_upload(
     if auth.agent_ref().is_some() {
         return Err(ApiError::Forbidden);
     }
-    let (created, upload) = uploads::initiate(
-        &state.pool,
-        &state.object_store,
-        &state.config,
-        &auth,
-        request,
-    )
-    .await?;
+    let (created, upload) = state
+        .store
+        .initiate_upload(&state.object_store, &state.config, &auth, request)
+        .await?;
     let finalizing = upload.status == "finalizing";
     let mut response = (
         if created {
@@ -415,7 +412,11 @@ async fn complete_file_upload(
     if auth.agent_ref().is_some() {
         return Err(ApiError::Forbidden);
     }
-    match uploads::complete(&state.pool, &state.object_store, &state.config, &auth, &id).await {
+    match state
+        .store
+        .complete_upload(&state.object_store, &state.config, &auth, &id)
+        .await
+    {
         Ok((created, file)) => Ok((
             if created {
                 StatusCode::CREATED
@@ -449,9 +450,7 @@ async fn get_file(
     Path(id): Path<String>,
 ) -> ApiResult<Json<FileResponse>> {
     auth.require(Permission::FileRead)?;
-    Ok(Json(
-        files::get_owned(&state.pool, &auth, &id).await?.into(),
-    ))
+    Ok(Json(state.store.get_owned_file(&auth, &id).await?.into()))
 }
 
 async fn get_file_content(
@@ -460,7 +459,7 @@ async fn get_file_content(
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
     auth.require(Permission::FileRead)?;
-    let file = files::get_owned(&state.pool, &auth, &id).await?;
+    let file = state.store.get_owned_file(&auth, &id).await?;
     stream_file(&state, file).await
 }
 
@@ -470,7 +469,10 @@ async fn delete_file(
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     auth.require(Permission::FileDelete)?;
-    files::remove(&state.pool, &state.object_store, &auth, &id).await?;
+    state
+        .store
+        .remove_file(&state.object_store, &auth, &id)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -490,7 +492,7 @@ async fn create_file_download(
     Json(request): Json<CreateDownload>,
 ) -> ApiResult<Json<DownloadGrant>> {
     auth.require(Permission::FileGrant)?;
-    files::get_owned(&state.pool, &auth, &id).await?;
+    state.store.get_owned_file(&auth, &id).await?;
     if request.delivery == DownloadDelivery::Redirect && !state.object_store.supports_public_urls()
     {
         return Err(ApiError::BadRequest(
@@ -524,7 +526,7 @@ async fn download_file(
     ) {
         return Err(ApiError::NotFound("File capability not found.".into()));
     }
-    let file = files::get_owned(&state.pool, &actor, &id).await?;
+    let file = state.store.get_owned_file(&actor, &id).await?;
     match query.delivery {
         DownloadDelivery::Redirect => {
             let url = state

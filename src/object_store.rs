@@ -452,6 +452,8 @@ mod tests {
             s3_secret_access_key: "secret".into(),
             s3_force_path_style: true,
             direct_upload_enabled,
+            sqlite_busy_timeout_ms: 5000,
+            sqlite_synchronous_full: true,
             file_upload_url_ttl_seconds: 60,
             file_upload_session_ttl_seconds: 3600,
             auth_mode: crate::config::AuthMode::Jwt,

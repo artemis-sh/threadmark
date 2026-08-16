@@ -20,6 +20,8 @@ pub struct Inner {
     pub s3_secret_access_key: String,
     pub s3_force_path_style: bool,
     pub direct_upload_enabled: bool,
+    pub sqlite_busy_timeout_ms: u64,
+    pub sqlite_synchronous_full: bool,
     pub file_upload_url_ttl_seconds: u64,
     pub file_upload_session_ttl_seconds: u64,
     pub auth_mode: AuthMode,
@@ -147,6 +149,12 @@ impl Config {
                 .parse()
                 .context("S3_FORCE_PATH_STYLE must be true or false")?,
             direct_upload_enabled,
+            sqlite_busy_timeout_ms: parse("SQLITE_BUSY_TIMEOUT_MS", "5000")?,
+            // FULL survives power loss; NORMAL survives process death and is
+            // markedly faster. FULL is the safe default for a durable ledger.
+            sqlite_synchronous_full: std::env::var("SQLITE_SYNCHRONOUS")
+                .unwrap_or_else(|_| "full".into())
+                .eq_ignore_ascii_case("full"),
             file_upload_url_ttl_seconds,
             file_upload_session_ttl_seconds,
             auth_mode,
