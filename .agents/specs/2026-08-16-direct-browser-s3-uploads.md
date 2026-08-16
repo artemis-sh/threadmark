@@ -18,8 +18,9 @@ atomically create the existing finalized `files` record.
 
 Pending uploads cannot be read, downloaded, or referenced by conversation
 items. Expired and abandoned objects are removed by a durable cleanup process.
-The existing `POST /v1/files` multipart endpoint remains available during the
-alpha period, but direct upload is the preferred browser path.
+`POST /v1/files` remains a supported server-mediated multipart upload path for
+clients that cannot reach S3 directly. Direct upload is the preferred browser
+path because it keeps payload bytes out of Threadmark.
 
 ## Motivation
 
@@ -68,7 +69,7 @@ copy to a key for which the browser has never received write authority.
 - Malware scanning, media transcoding, or content-based MIME detection.
 - Public buckets or long-lived browser S3 credentials.
 - Making one transaction span PostgreSQL and S3.
-- Removing the existing server-mediated multipart endpoint in this change.
+- Removing the supported server-mediated multipart endpoint.
 - Eliminating buffering in the existing `inline` replay projection.
 
 ## Proposal
@@ -414,12 +415,10 @@ existing unversioned finalized-file delete creates a delete marker immediately,
 while lifecycle later reclaims the now-noncurrent committed bytes. Quota and
 monitoring include noncurrent versions.
 
-Enabling versioning affects legacy objects written by `POST /v1/files` under the
-existing owner-prefixed keys. Before versioning is enabled, lifecycle rules must
-also expire noncurrent versions and delete markers under that legacy prefix, or
-legacy deletion must first migrate to the version-aware outbox. This prerequisite
-prevents the existing unversioned delete and failed-database-insert cleanup paths
-from leaking billable versions.
+Versioning also affects objects written by the supported server-mediated
+`POST /v1/files` path under the existing owner-prefixed keys. The server-mediated
+cleanup path must use version-aware deletion so normal deletion and failed
+database-insert cleanup do not leak billable versions.
 
 The object-store credential provider uses the AWS default credential chain and
 supports refreshable role credentials, including session tokens. Presigned POST
@@ -485,12 +484,13 @@ delete. Deployment validation fails if tag-filtered lifecycle and versioning
 rules are absent. Lifecycle periods must leave enough margin for a live
 finalizer to commit the tag change before provider expiration evaluation.
 
-### Existing multipart endpoint
+### Server-mediated multipart endpoint
 
-`POST /v1/files` remains behaviorally compatible for non-browser clients during
-alpha. Documentation labels it server-mediated and memory-buffered. It continues
-to produce only finalized `files` rows. Follow-up work may stream its request
-body or remove it after clients migrate; neither is required for this RFC.
+`POST /v1/files` remains a supported path for clients that cannot reach S3
+directly or do not implement the upload-session workflow. It is
+server-mediated and memory-buffered, and continues to produce only finalized
+`files` rows. Follow-up work may stream its request body, but this RFC does not
+plan to remove the endpoint.
 
 ### Errors and observability
 
@@ -600,7 +600,7 @@ Consumers must continue treating served content as untrusted; downloads retain
   regardless of the delayed tag value.
 - Verify a POST replay after completion changes only the staging key and cannot
   change downloaded finalized bytes.
-- Verify multipart upload remains compatible.
+- Verify server-mediated multipart upload remains supported.
 - Run browser CORS tests and payload-integrity checks against MinIO and the
   production-compatible provider using files at zero, typical, and maximum size.
 - In a versioning-enabled provider test, replay an upload form, abandon copies,
@@ -610,7 +610,7 @@ Consumers must continue treating served content as untrusted; downloads retain
 - Suspend versioning after startup and assert both `"null"` staging/candidate
   versions and read-only configuration drift disable initiation/finalization
   before a file can be committed.
-- With versioning enabled, exercise legacy multipart upload, normal deletion, and
+- With versioning enabled, exercise server-mediated multipart upload, normal deletion, and
   database failure after PUT; verify lifecycle or version-aware cleanup reclaims
   all versions and delete markers.
 - Test refreshable temporary credentials, required session-token POST fields,
