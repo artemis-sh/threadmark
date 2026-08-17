@@ -11,9 +11,9 @@ use crate::{
     files,
     ids::new_id,
     model::{
-        Actor, AppendItems, AppendResult, Continuation, Conversation, CreateContinuation,
-        CreateConversation, CreateTurn, FileDelivery, Item, ReplayRequest, ReplayResult, StartTurn,
-        StartTurnResult, Turn, UpdateConversation, UpdateTurn,
+        Actor, AgentReplayResult, AppendItems, AppendResult, Continuation, Conversation,
+        CreateContinuation, CreateConversation, CreateTurn, FileDelivery, Item, ReplayRequest,
+        ReplayResult, StartTurn, StartTurnResult, Turn, UpdateConversation, UpdateTurn,
     },
 };
 
@@ -854,6 +854,181 @@ pub async fn replay(
     })
 }
 
+pub async fn agent_replay(
+    state: &AppState,
+    actor: &Actor,
+    conversation_id: &str,
+    turn_id: &str,
+    agent_ref: &str,
+) -> ApiResult<AgentReplayResult> {
+    let mut tx = state.pool.begin().await?;
+    // The turn boundary, conversation ownership, and selected items must be one
+    // observation even while an owner truncates the transcript.
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let (first_seq, through_seq) = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT turn_start.first_seq, turn_start.last_seq
+         FROM conversations conversation
+         JOIN turns turn ON turn.conversation_id = conversation.id
+         JOIN turn_starts turn_start ON turn_start.turn_id = turn.id
+           AND turn_start.conversation_id = conversation.id
+         WHERE conversation.id = $1 AND turn.id = $2 AND turn.agent_ref = $3
+           AND conversation.tenant_id = $4 AND conversation.owner_ref = $5",
+    )
+    .bind(conversation_id)
+    .bind(turn_id)
+    .bind(agent_ref)
+    .bind(&actor.tenant_id)
+    .bind(&actor.principal_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Agent replay not found.".into()))?;
+
+    let (item_count, snapshot_complete) = sqlx::query_as::<_, (i64, bool)>(
+        "SELECT count(*)::bigint,
+                EXISTS(SELECT 1 FROM conversation_items
+                       WHERE conversation_id = $1 AND seq = $2)
+                AND (SELECT count(*) FROM turn_start_items item
+                     JOIN turn_starts start ON start.id = item.turn_start_id
+                     WHERE start.turn_id = $3) = $2 - $4 + 1
+                AND NOT EXISTS(
+                    SELECT 1 FROM turn_start_items item
+                    JOIN turn_starts start ON start.id = item.turn_start_id
+                    LEFT JOIN conversation_items transcript
+                      ON transcript.id = item.item_id
+                     AND transcript.conversation_id = $1
+                     AND transcript.seq = item.seq
+                     AND transcript.turn_id = $3
+                    WHERE start.turn_id = $3 AND transcript.id IS NULL)
+         FROM conversation_items
+         WHERE conversation_id = $1 AND seq <= $2",
+    )
+    .bind(conversation_id)
+    .bind(through_seq)
+    .bind(turn_id)
+    .bind(first_seq)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !snapshot_complete {
+        return Err(ApiError::CodedConflict {
+            code: "replay_snapshot_unavailable",
+            message: "The turn input boundary is not present in this transcript snapshot.".into(),
+        });
+    }
+    if usize::try_from(item_count).unwrap_or(usize::MAX) > state.config.agent_replay_max_items {
+        return Err(context_limit("item count"));
+    }
+    let rows = sqlx::query_as::<_, (i64, Value)>(
+        "SELECT seq, payload FROM conversation_items
+         WHERE conversation_id = $1 AND seq <= $2 ORDER BY seq ASC",
+    )
+    .bind(conversation_id)
+    .bind(through_seq)
+    .fetch_all(&mut *tx)
+    .await?;
+    let input = build_agent_projection(
+        rows,
+        &state.config.agent_replay_strip_top_level_fields,
+        state.config.agent_replay_max_items,
+        state.config.agent_replay_max_bytes,
+    )?;
+    tx.commit().await?;
+    Ok(AgentReplayResult {
+        conversation_id: conversation_id.into(),
+        turn_id: turn_id.into(),
+        through_seq,
+        input,
+    })
+}
+
+fn context_limit(limit: &str) -> ApiError {
+    ApiError::CodedPayloadTooLarge {
+        code: "context_limit_exceeded",
+        message: format!("Agent replay exceeds the configured {limit} limit."),
+    }
+}
+
+fn build_agent_projection(
+    rows: Vec<(i64, Value)>,
+    strip_top_level_fields: &[String],
+    max_items: usize,
+    max_bytes: usize,
+) -> ApiResult<Vec<Value>> {
+    if rows.len() > max_items {
+        return Err(context_limit("item count"));
+    }
+    let mut input = Vec::with_capacity(rows.len());
+    for (_, mut item) in rows {
+        validate_agent_text_item(&item)?;
+        let object = item.as_object_mut().expect("validated message object");
+        for field in strip_top_level_fields {
+            object.remove(field);
+        }
+        input.push(item);
+    }
+    let serialized_bytes = serde_json::to_vec(&input)
+        .map_err(|error| ApiError::BadRequest(format!("could not serialize replay: {error}")))?
+        .len();
+    if serialized_bytes > max_bytes {
+        return Err(context_limit("serialized byte"));
+    }
+    Ok(input)
+}
+
+fn validate_agent_text_item(item: &Value) -> ApiResult<()> {
+    if contains_threadmark_uri(item) {
+        return Err(unsupported_agent_replay_item());
+    }
+    let object = item.as_object().ok_or_else(unsupported_agent_replay_item)?;
+    if object.get("type").and_then(Value::as_str) != Some("message") {
+        return Err(unsupported_agent_replay_item());
+    }
+    let expected_part = match object.get("role").and_then(Value::as_str) {
+        Some("user") => "input_text",
+        Some("assistant") => "output_text",
+        _ => return Err(unsupported_agent_replay_item()),
+    };
+    let content = object
+        .get("content")
+        .and_then(Value::as_array)
+        .filter(|content| !content.is_empty())
+        .ok_or_else(unsupported_agent_replay_item)?;
+    if content.iter().any(|part| {
+        let Some(part) = part.as_object() else {
+            return true;
+        };
+        let allowed_fields: &[&str] = if expected_part == "input_text" {
+            &["type", "text"]
+        } else {
+            &["type", "text", "annotations"]
+        };
+        part.keys().any(|field| !allowed_fields.contains(&field.as_str()))
+            || part.get("type").and_then(Value::as_str) != Some(expected_part)
+            || part.get("text").and_then(Value::as_str).is_none()
+    }) {
+        return Err(unsupported_agent_replay_item());
+    }
+    Ok(())
+}
+
+fn contains_threadmark_uri(value: &Value) -> bool {
+    match value {
+        Value::String(value) => files::parse_uri(value).is_some(),
+        Value::Array(values) => values.iter().any(contains_threadmark_uri),
+        Value::Object(values) => values.values().any(contains_threadmark_uri),
+        _ => false,
+    }
+}
+
+fn unsupported_agent_replay_item() -> ApiError {
+    ApiError::CodedBadRequest {
+        code: "unsupported_agent_replay_item",
+        message: "Agent replay supports only user input_text and assistant output_text messages."
+            .into(),
+    }
+}
+
 async fn hydrate_file_references(
     state: &AppState,
     actor: &Actor,
@@ -1353,5 +1528,122 @@ mod tests {
             referenced_file_ids(&value),
             vec!["file_document".to_owned(), "file_image".to_owned()]
         );
+    }
+
+    #[test]
+    fn agent_replay_accepts_only_the_text_message_contract() {
+        let rows = vec![
+            (
+                1,
+                json!({
+                    "id": "provider-user-id",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}]
+                }),
+            ),
+            (
+                2,
+                json!({
+                    "id": "provider-output-id",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hi", "annotations": []}]
+                }),
+            ),
+        ];
+        let projected = build_agent_projection(rows, &["id".into()], 2, usize::MAX).unwrap();
+        assert!(projected.iter().all(|item| item.get("id").is_none()));
+        assert_eq!(projected[0]["role"], "user");
+        assert_eq!(projected[1]["role"], "assistant");
+        assert_eq!(projected[1]["content"][0]["annotations"], json!([]));
+    }
+
+    #[test]
+    fn agent_replay_strips_only_configured_top_level_fields() {
+        let projected = build_agent_projection(
+            vec![(
+                1,
+                json!({
+                    "id": "keep-me",
+                    "metadata": {"id": "nested", "private": true},
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}]
+                }),
+            )],
+            &["metadata".into()],
+            1,
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(projected[0]["id"], "keep-me");
+        assert!(projected[0].get("metadata").is_none());
+    }
+
+    #[test]
+    fn agent_replay_item_limit_is_inclusive() {
+        let item = json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}]
+        });
+        assert!(build_agent_projection(vec![(1, item.clone())], &[], 1, usize::MAX).is_ok());
+        assert!(matches!(
+            build_agent_projection(vec![(1, item)], &[], 0, usize::MAX),
+            Err(ApiError::CodedPayloadTooLarge { code: "context_limit_exceeded", .. })
+        ));
+    }
+
+    #[test]
+    fn agent_replay_serialized_byte_limit_is_inclusive() {
+        let item = json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}]
+        });
+        let expected = vec![item.clone()];
+        let exact = serde_json::to_vec(&expected).unwrap().len();
+        assert!(build_agent_projection(vec![(1, item.clone())], &[], 1, exact).is_ok());
+        assert!(matches!(
+            build_agent_projection(vec![(1, item)], &[], 1, exact - 1),
+            Err(ApiError::CodedPayloadTooLarge { code: "context_limit_exceeded", .. })
+        ));
+    }
+
+    #[test]
+    fn agent_replay_rejects_media_and_role_part_mismatches() {
+        for item in [
+            json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_image", "image_url": "threadmark://files/file_1"}]
+            }),
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "input_text", "text": "wrong direction"}]
+            }),
+            json!({
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "hello",
+                    "image_url": "data:image/png;base64,AAAA"
+                }]
+            }),
+            json!({
+                "type": "message",
+                "role": "user",
+                "metadata": {"source": "threadmark://files/file_1"},
+                "content": [{"type": "input_text", "text": "hello"}]
+            }),
+        ] {
+            assert!(matches!(
+                build_agent_projection(vec![(1, item)], &[], 1, usize::MAX),
+                Err(ApiError::CodedBadRequest { code: "unsupported_agent_replay_item", .. })
+            ));
+        }
     }
 }

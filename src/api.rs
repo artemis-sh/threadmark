@@ -17,11 +17,12 @@ use crate::{
     error::{ApiError, ApiResult},
     files,
     model::{
-        Actor, AppendItems, AppendResult, Continuation, ContinuationQuery, Conversation,
-        CreateContinuation, CreateConversation, CreateDownload, CreateTurn, DownloadDelivery,
-        DownloadGrant, FileResponse, Item, ListConversationsQuery, ListItemsQuery,
-        RegenerateResult, ReplayRequest, ReplayResult, StartTurn, StartTurnResult, StrictJson,
-        TruncateConversation, Turn, UpdateConversation, UpdateTurn, validate_json_number_tokens,
+        Actor, AgentReplayResult, AppendItems, AppendResult, Continuation, ContinuationQuery,
+        Conversation, CreateContinuation, CreateConversation, CreateDownload, CreateTurn,
+        DownloadDelivery, DownloadGrant, FileResponse, Item, ListConversationsQuery,
+        ListItemsQuery, RegenerateResult, ReplayRequest, ReplayResult, StartTurn, StartTurnResult,
+        StrictJson, TruncateConversation, Turn, UpdateConversation, UpdateTurn,
+        validate_json_number_tokens,
     },
     object_store::ObjectStore,
     store, uploads,
@@ -54,6 +55,10 @@ pub fn router(state: AppState) -> Router {
             get(list_items).post(append_items),
         )
         .route("/v1/conversations/{id}/replay", post(replay))
+        .route(
+            "/v1/conversations/{conversation_id}/turns/{turn_id}/agent-replay",
+            post(agent_replay),
+        )
         .route(
             "/v1/conversations/{id}/turns",
             get(list_turns).post(create_turn),
@@ -231,6 +236,26 @@ async fn replay(
         auth.require(Permission::FileRead)?;
     }
     Ok(Json(store::replay(&state, &auth, &id, request).await?))
+}
+
+async fn agent_replay(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path((conversation_id, turn_id)): Path<(String, String)>,
+    body: Bytes,
+) -> ApiResult<Json<AgentReplayResult>> {
+    auth.require(Permission::AgentReplay)?;
+    if !body.is_empty() {
+        return Err(ApiError::BadRequest(
+            "agent replay does not accept a request body".into(),
+        ));
+    }
+    let agent_ref = auth
+        .require_agent_replay_scope(&conversation_id, &turn_id)?
+        .to_owned();
+    Ok(Json(
+        store::agent_replay(&state, &auth, &conversation_id, &turn_id, &agent_ref).await?,
+    ))
 }
 
 async fn create_turn(

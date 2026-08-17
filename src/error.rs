@@ -13,6 +13,8 @@ pub enum ApiError {
     Forbidden,
     #[error("{0}")]
     BadRequest(String),
+    #[error("{message}")]
+    CodedBadRequest { code: &'static str, message: String },
     #[error("{0}")]
     NotFound(String),
     #[error("{0}")]
@@ -25,6 +27,8 @@ pub enum ApiError {
     CodedUnavailable { code: &'static str, message: String },
     #[error("{0}")]
     PayloadTooLarge(String),
+    #[error("{message}")]
+    CodedPayloadTooLarge { code: &'static str, message: String },
     #[error("object storage operation failed")]
     ObjectStore(#[source] anyhow::Error),
     #[error("database operation failed")]
@@ -37,12 +41,16 @@ impl IntoResponse for ApiError {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
+            Self::CodedBadRequest { code, .. } => (StatusCode::BAD_REQUEST, *code),
             Self::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             Self::CodedConflict { code, .. } => (StatusCode::CONFLICT, *code),
             Self::CodedGone { code, .. } => (StatusCode::GONE, *code),
             Self::CodedUnavailable { code, .. } => (StatusCode::SERVICE_UNAVAILABLE, *code),
             Self::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
+            Self::CodedPayloadTooLarge { code, .. } => {
+                (StatusCode::PAYLOAD_TOO_LARGE, *code)
+            }
             Self::ObjectStore(error) => {
                 tracing::error!(?error, "object storage request failed");
                 (StatusCode::BAD_GATEWAY, "object_store_error")

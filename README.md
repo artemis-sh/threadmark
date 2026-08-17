@@ -77,6 +77,7 @@ This is an experiment and its API is not stable. The current slice establishes:
 - Idempotent item batches and turn creation.
 - Cursor-based item reads.
 - Open Responses replay projection with optional top-level `id` removal.
+- Snapshot-consistent, size-bounded text replay for delegated agent turns.
 - Agent-scoped continuation records and optional private checkpoint state.
 
 Editing, branching, retention, event delivery, production authentication, and
@@ -140,12 +141,53 @@ mode. Production uses
 `AUTH_MODE=jwt` with `AUTH_ISSUER`, `AUTH_AUDIENCE`, and an HTTPS
 `AUTH_JWKS_URL`. JWT mode accepts Ed25519 `at+jwt` owner-session tokens and
 derives tenant, principal, and endpoint permissions exclusively from verified
-claims. Delegated-agent tokens remain rejected until their resource-bound write
-invariants are implemented.
+claims. It also accepts delegated-agent tokens only for the agent replay
+operation described below. Delegated writes remain disabled.
 
 An agent called by Parley can receive a short-lived token scoped to the same
 tenant, principal, conversation, turn, and agent deployment. That authorization
 layer is deliberately separate from the ledger model.
+
+### Bounded agent replay
+
+`POST /v1/conversations/{conversation_id}/turns/{turn_id}/agent-replay` is the
+initial Bonsai replay integration. It accepts no request body and requires a
+`delegated_agent` JWT with `transcript:read` and exact `tenant`, `principal`,
+`conversation_id`, `turn_id`, and `agent_ref` bounds. Wrong actor or resource
+bounds return a non-enumerating error. The turn must have been created by
+`POST /v1/turn-starts`; its recorded `last_seq` is the immutable replay cursor.
+
+The operation opens a PostgreSQL repeatable-read, read-only transaction before
+resolving ownership, the atomic-start boundary, and ordered items. It verifies
+the complete triggering batch still exists in that snapshot. A concurrent
+truncate is therefore observed wholly before or wholly after its commit; a
+snapshot missing the boundary returns `replay_snapshot_unavailable` and never
+returns a cursor for absent turn-start input.
+
+The first integration supports only these historical message shapes:
+
+- `type=message`, `role=user`, with a nonempty array of `input_text` parts
+  containing only string `text` plus the `type` discriminator;
+- `type=message`, `role=assistant`, with a nonempty array of `output_text` parts
+  containing string `text`, the `type` discriminator, and optional
+  `annotations`.
+
+Other item types, roles, non-text parts, mixed content, and media return
+`unsupported_agent_replay_item`. In particular, file and image parts are never
+forwarded, and any canonical file URI anywhere in an item is rejected, so
+unresolved `threadmark://` resources cannot reach a model provider through this
+endpoint. Accepted top-level item fields are otherwise preserved. Only
+top-level fields named by `AGENT_REPLAY_STRIP_TOP_LEVEL_FIELDS` (comma-separated,
+default `id`) are removed; nested fields are untouched.
+
+`AGENT_REPLAY_MAX_ITEMS` (default `200`) and `AGENT_REPLAY_MAX_BYTES` (default
+`1048576`) are hard inclusive limits. The byte limit is the exact compact JSON
+serialization of the returned `input` array after configured field removal.
+Exceeding either limit returns HTTP `413` with
+`error.code=context_limit_exceeded` before a projection is returned.
+
+The existing owner endpoint, `POST /v1/conversations/{id}/replay`, is unchanged:
+it remains an opaque, multimodal projection with caller-selected file delivery.
 
 ## Example flow
 
@@ -236,6 +278,7 @@ GET /v1/continuations/resp_abc?agent_ref=research-agent%2Fprod
 | `GET` | `/v1/conversations/{id}/items` | Read ordered items after a sequence cursor |
 | `POST` | `/v1/conversations/{id}/items` | Atomically append an idempotent item batch |
 | `POST` | `/v1/conversations/{id}/replay` | Build an Open Responses input array |
+| `POST` | `/v1/conversations/{conversation_id}/turns/{turn_id}/agent-replay` | Build bounded text input for a delegated agent turn |
 | `POST` | `/v1/conversations/{id}/turns` | Create an idempotent turn |
 | `PATCH` | `/v1/turns/{id}` | Update turn state and outcome |
 | `POST` | `/v1/conversations/{id}/continuations` | Record an agent checkpoint |

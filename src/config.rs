@@ -27,6 +27,10 @@ pub struct Inner {
     pub auth_audience: Option<String>,
     pub auth_jwks_url: Option<String>,
     pub auth_max_owner_token_seconds: u64,
+    pub auth_max_delegated_token_seconds: u64,
+    pub agent_replay_max_items: usize,
+    pub agent_replay_max_bytes: usize,
+    pub agent_replay_strip_top_level_fields: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +104,43 @@ impl Config {
             auth_max_owner_token_seconds > 0,
             "AUTH_MAX_OWNER_TOKEN_SECONDS must be greater than zero"
         );
+        let auth_max_delegated_token_seconds =
+            parse("AUTH_MAX_DELEGATED_TOKEN_SECONDS", "600")?;
+        ensure!(
+            auth_max_delegated_token_seconds > 0,
+            "AUTH_MAX_DELEGATED_TOKEN_SECONDS must be greater than zero"
+        );
+        let agent_replay_max_items = usize::try_from(parse("AGENT_REPLAY_MAX_ITEMS", "200")?)
+            .context("AGENT_REPLAY_MAX_ITEMS is too large")?;
+        ensure!(
+            agent_replay_max_items > 0,
+            "AGENT_REPLAY_MAX_ITEMS must be greater than zero"
+        );
+        let agent_replay_max_bytes = usize::try_from(parse("AGENT_REPLAY_MAX_BYTES", "1048576")?)
+            .context("AGENT_REPLAY_MAX_BYTES is too large")?;
+        ensure!(
+            agent_replay_max_bytes > 0,
+            "AGENT_REPLAY_MAX_BYTES must be greater than zero"
+        );
+        let agent_replay_strip_top_level_fields = std::env::var(
+            "AGENT_REPLAY_STRIP_TOP_LEVEL_FIELDS",
+        )
+        .unwrap_or_else(|_| "id".into())
+        .split(',')
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        let mut unique_fields = agent_replay_strip_top_level_fields.clone();
+        unique_fields.sort();
+        unique_fields.dedup();
+        ensure!(
+            unique_fields.len() == agent_replay_strip_top_level_fields.len()
+                && agent_replay_strip_top_level_fields
+                    .iter()
+                    .all(|field| field.chars().count() <= 200),
+            "AGENT_REPLAY_STRIP_TOP_LEVEL_FIELDS must contain unique field names of at most 200 characters"
+        );
         let direct_upload_enabled = std::env::var("DIRECT_UPLOAD_ENABLED")
             .unwrap_or_else(|_| "false".into())
             .parse()
@@ -154,6 +195,10 @@ impl Config {
             auth_audience,
             auth_jwks_url,
             auth_max_owner_token_seconds,
+            auth_max_delegated_token_seconds,
+            agent_replay_max_items,
+            agent_replay_max_bytes,
+            agent_replay_strip_top_level_fields,
         })))
     }
 }
