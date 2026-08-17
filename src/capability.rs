@@ -120,6 +120,10 @@ mod tests {
             auth_audience: None,
             auth_jwks_url: None,
             auth_max_owner_token_seconds: 300,
+            auth_max_delegated_token_seconds: 600,
+            agent_replay_max_items: 200,
+            agent_replay_max_bytes: 1024 * 1024,
+            agent_replay_strip_top_level_fields: vec!["id".into()],
         }))
     }
 

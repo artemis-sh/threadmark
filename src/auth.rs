@@ -32,6 +32,7 @@ struct JwtVerifier {
     issuer: String,
     audience: String,
     max_owner_seconds: u64,
+    max_delegated_seconds: u64,
     keys: HashMap<String, DecodingKey>,
 }
 
@@ -40,7 +41,16 @@ pub struct AuthContext {
     pub actor: Actor,
     pub client_id: String,
     agent_ref: Option<String>,
+    conversation_id: Option<String>,
+    turn_id: Option<String>,
+    token_kind: TokenKind,
     permissions: HashSet<Permission>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TokenKind {
+    OwnerSession,
+    DelegatedAgent,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -53,6 +63,7 @@ pub enum Permission {
     ConversationTruncate,
     ConversationRegenerate,
     TranscriptRead,
+    AgentReplay,
     TranscriptAppend,
     TurnCreate,
     TurnRead,
@@ -102,6 +113,8 @@ struct Claims {
     principal: String,
     permissions: Vec<String>,
     agent_ref: Option<String>,
+    conversation_id: Option<String>,
+    turn_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +159,7 @@ impl Authenticator {
                     issuer,
                     audience,
                     config.auth_max_owner_token_seconds,
+                    config.auth_max_delegated_token_seconds,
                     jwks,
                 )?)
             }
@@ -167,6 +181,7 @@ impl JwtVerifier {
         issuer: String,
         audience: String,
         max_owner_seconds: u64,
+        max_delegated_seconds: u64,
         jwks: JwkSet,
     ) -> anyhow::Result<Self> {
         ensure!(!jwks.keys.is_empty(), "JWKS contains no keys");
@@ -191,6 +206,7 @@ impl JwtVerifier {
             issuer,
             audience,
             max_owner_seconds,
+            max_delegated_seconds,
             keys,
         })
     }
@@ -219,17 +235,25 @@ impl JwtVerifier {
 impl Claims {
     fn context(self, verifier: &JwtVerifier) -> Option<AuthContext> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+        let token_kind = match self.token_kind.as_str() {
+            "owner_session" => TokenKind::OwnerSession,
+            "delegated_agent" => TokenKind::DelegatedAgent,
+            _ => return None,
+        };
         let valid_audience = match &self.aud {
             Audience::One(value) => value == &verifier.audience,
             Audience::Many(values) => values.len() == 1 && values[0] == verifier.audience,
         };
         if self.iss != verifier.issuer
             || !valid_audience
-            || self.token_kind != "owner_session"
             || self.exp <= self.iat
             || self.exp <= self.nbf
             || self.iat > now.saturating_add(30)
-            || self.exp.saturating_sub(self.iat) > verifier.max_owner_seconds
+            || self.exp.saturating_sub(self.iat)
+                > match token_kind {
+                    TokenKind::OwnerSession => verifier.max_owner_seconds,
+                    TokenKind::DelegatedAgent => verifier.max_delegated_seconds,
+                }
             || !valid_id(&self.sub)
             || !valid_id(&self.client_id)
             || self.client_id == "threadmark:trusted-headers"
@@ -240,14 +264,34 @@ impl Claims {
                 .agent_ref
                 .as_deref()
                 .is_some_and(|value| !valid_id(value))
+            || self
+                .conversation_id
+                .as_deref()
+                .is_some_and(|value| !valid_id(value))
+            || self
+                .turn_id
+                .as_deref()
+                .is_some_and(|value| !valid_id(value))
         {
             return None;
         }
-        let permissions = self
+        let mut permissions = self
             .permissions
             .iter()
             .map(|value| Permission::parse(value))
             .collect::<Option<HashSet<_>>>()?;
+        if token_kind == TokenKind::DelegatedAgent
+            && (self.conversation_id.is_none()
+                || self.turn_id.is_none()
+                || self.agent_ref.is_none()
+                || permissions.len() != 1
+                || !permissions.contains(&Permission::TranscriptRead))
+        {
+            return None;
+        }
+        if token_kind == TokenKind::DelegatedAgent {
+            permissions = [Permission::AgentReplay].into_iter().collect();
+        }
         Some(AuthContext {
             actor: Actor {
                 tenant_id: self.tenant,
@@ -255,6 +299,9 @@ impl Claims {
             },
             client_id: self.client_id,
             agent_ref: self.agent_ref,
+            conversation_id: self.conversation_id,
+            turn_id: self.turn_id,
+            token_kind,
             permissions,
         })
     }
@@ -279,6 +326,22 @@ impl AuthContext {
             }
             _ => Ok(()),
         }
+    }
+
+    pub fn require_agent_replay_scope(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> Result<&str, ApiError> {
+        if self.token_kind != TokenKind::DelegatedAgent
+            || self.conversation_id.as_deref() != Some(conversation_id)
+            || self.turn_id.as_deref() != Some(turn_id)
+        {
+            return Err(ApiError::NotFound("Agent replay not found.".into()));
+        }
+        self.agent_ref
+            .as_deref()
+            .ok_or_else(|| ApiError::NotFound("Agent replay not found.".into()))
     }
 }
 
@@ -353,6 +416,9 @@ fn trusted_headers(headers: &HeaderMap) -> Result<AuthContext, ApiError> {
         },
         client_id: "threadmark:trusted-headers".into(),
         agent_ref: None,
+        conversation_id: None,
+        turn_id: None,
+        token_kind: TokenKind::OwnerSession,
         permissions: OWNER_PERMISSIONS.into_iter().collect(),
     })
 }
@@ -385,6 +451,7 @@ mod tests {
             "https://issuer.example".into(),
             "threadmark-api".into(),
             300,
+            600,
             jwks,
         )
         .unwrap()
@@ -490,6 +557,57 @@ mod tests {
         claims["token_kind"] = json!("delegated_agent");
         assert!(matches!(
             verifier().authenticate(&headers(&claims)),
+            Err(ApiError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn delegated_replay_token_enforces_all_resource_bounds() {
+        let mut claims = claims();
+        claims["token_kind"] = json!("delegated_agent");
+        claims["permissions"] = json!(["transcript:read"]);
+        claims["conversation_id"] = json!("conv_1");
+        claims["turn_id"] = json!("turn_1");
+        claims["agent_ref"] = json!("bonsai/prod");
+        let context = verifier().authenticate(&headers(&claims)).unwrap();
+        assert_eq!(
+            context
+                .require_agent_replay_scope("conv_1", "turn_1")
+                .unwrap(),
+            "bonsai/prod"
+        );
+        assert!(context.require(Permission::AgentReplay).is_ok());
+        assert!(matches!(
+            context.require(Permission::TranscriptRead),
+            Err(ApiError::Forbidden)
+        ));
+        assert!(matches!(
+            context.require_agent_replay_scope("conv_other", "turn_1"),
+            Err(ApiError::NotFound(_))
+        ));
+        assert!(matches!(
+            context.require_agent_replay_scope("conv_1", "turn_other"),
+            Err(ApiError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn delegated_tokens_reject_missing_scope_and_owner_permissions() {
+        let mut missing_turn = claims();
+        missing_turn["token_kind"] = json!("delegated_agent");
+        missing_turn["permissions"] = json!(["transcript:read"]);
+        missing_turn["conversation_id"] = json!("conv_1");
+        missing_turn["agent_ref"] = json!("bonsai/prod");
+        assert!(matches!(
+            verifier().authenticate(&headers(&missing_turn)),
+            Err(ApiError::Unauthorized)
+        ));
+
+        let mut broad = missing_turn;
+        broad["turn_id"] = json!("turn_1");
+        broad["permissions"] = json!(["transcript:read", "conversation:read"]);
+        assert!(matches!(
+            verifier().authenticate(&headers(&broad)),
             Err(ApiError::Unauthorized)
         ));
     }

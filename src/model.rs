@@ -336,6 +336,14 @@ pub struct ReplayResult {
     pub input: Vec<Value>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct AgentReplayResult {
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub through_seq: i64,
+    pub input: Vec<Value>,
+}
+
 #[derive(Debug, Serialize, FromRow)]
 pub struct Turn {
     pub id: String,
