@@ -32,6 +32,7 @@ struct JwtVerifier {
     issuer: String,
     audience: String,
     max_owner_seconds: u64,
+    max_delegated_seconds: u64,
     keys: HashMap<String, DecodingKey>,
 }
 
@@ -40,7 +41,16 @@ pub struct AuthContext {
     pub actor: Actor,
     pub client_id: String,
     agent_ref: Option<String>,
+    conversation_id: Option<String>,
+    turn_id: Option<String>,
+    token_kind: TokenKind,
     permissions: HashSet<Permission>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TokenKind {
+    OwnerSession,
+    DelegatedAgent,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -54,6 +64,7 @@ pub enum Permission {
     ConversationRegenerate,
     TranscriptRead,
     TranscriptAppend,
+    TranscriptAppendAgent,
     TurnCreate,
     TurnRead,
     TurnUpdate,
@@ -102,6 +113,8 @@ struct Claims {
     principal: String,
     permissions: Vec<String>,
     agent_ref: Option<String>,
+    conversation_id: Option<String>,
+    turn_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +159,7 @@ impl Authenticator {
                     issuer,
                     audience,
                     config.auth_max_owner_token_seconds,
+                    config.auth_max_delegated_token_seconds,
                     jwks,
                 )?)
             }
@@ -167,6 +181,7 @@ impl JwtVerifier {
         issuer: String,
         audience: String,
         max_owner_seconds: u64,
+        max_delegated_seconds: u64,
         jwks: JwkSet,
     ) -> anyhow::Result<Self> {
         ensure!(!jwks.keys.is_empty(), "JWKS contains no keys");
@@ -191,6 +206,7 @@ impl JwtVerifier {
             issuer,
             audience,
             max_owner_seconds,
+            max_delegated_seconds,
             keys,
         })
     }
@@ -225,11 +241,9 @@ impl Claims {
         };
         if self.iss != verifier.issuer
             || !valid_audience
-            || self.token_kind != "owner_session"
             || self.exp <= self.iat
             || self.exp <= self.nbf
             || self.iat > now.saturating_add(30)
-            || self.exp.saturating_sub(self.iat) > verifier.max_owner_seconds
             || !valid_id(&self.sub)
             || !valid_id(&self.client_id)
             || self.client_id == "threadmark:trusted-headers"
@@ -248,6 +262,25 @@ impl Claims {
             .iter()
             .map(|value| Permission::parse(value))
             .collect::<Option<HashSet<_>>>()?;
+        let token_kind = match self.token_kind.as_str() {
+            "owner_session"
+                if self.exp.saturating_sub(self.iat) <= verifier.max_owner_seconds
+                    && self.conversation_id.is_none()
+                    && self.turn_id.is_none() =>
+            {
+                TokenKind::OwnerSession
+            }
+            "delegated_agent"
+                if self.exp.saturating_sub(self.iat) <= verifier.max_delegated_seconds
+                    && self.conversation_id.as_deref().is_some_and(valid_id)
+                    && self.turn_id.as_deref().is_some_and(valid_id)
+                    && self.agent_ref.as_deref().is_some_and(valid_id)
+                    && permissions.iter().all(Permission::allowed_for_delegated) =>
+            {
+                TokenKind::DelegatedAgent
+            }
+            _ => return None,
+        };
         Some(AuthContext {
             actor: Actor {
                 tenant_id: self.tenant,
@@ -255,6 +288,9 @@ impl Claims {
             },
             client_id: self.client_id,
             agent_ref: self.agent_ref,
+            conversation_id: self.conversation_id,
+            turn_id: self.turn_id,
+            token_kind,
             permissions,
         })
     }
@@ -262,6 +298,13 @@ impl Claims {
 
 impl AuthContext {
     pub fn require(&self, permission: Permission) -> Result<(), ApiError> {
+        // Delegated operations are exposed only after their resource-bound store
+        // contract is implemented. The constrained append path is the first.
+        if self.token_kind == TokenKind::DelegatedAgent
+            && permission != Permission::TranscriptAppendAgent
+        {
+            return Err(ApiError::Forbidden);
+        }
         self.permissions
             .contains(&permission)
             .then_some(())
@@ -278,6 +321,42 @@ impl AuthContext {
                 Err(ApiError::NotFound("Agent resource not found.".into()))
             }
             _ => Ok(()),
+        }
+    }
+
+    pub fn is_delegated(&self) -> bool {
+        self.token_kind == TokenKind::DelegatedAgent
+    }
+
+    pub fn delegated_bounds(&self) -> Option<(&str, &str, &str)> {
+        self.is_delegated().then(|| {
+            (
+                self.conversation_id.as_deref().expect("validated claim"),
+                self.turn_id.as_deref().expect("validated claim"),
+                self.agent_ref.as_deref().expect("validated claim"),
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delegated_for_test(
+        tenant_id: &str,
+        principal_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        agent_ref: &str,
+    ) -> Self {
+        Self {
+            actor: Actor {
+                tenant_id: tenant_id.into(),
+                principal_id: principal_id.into(),
+            },
+            client_id: "test".into(),
+            agent_ref: Some(agent_ref.into()),
+            conversation_id: Some(conversation_id.into()),
+            turn_id: Some(turn_id.into()),
+            token_kind: TokenKind::DelegatedAgent,
+            permissions: [Permission::TranscriptAppendAgent].into_iter().collect(),
         }
     }
 }
@@ -313,6 +392,7 @@ impl Permission {
             "conversation:regenerate" => Self::ConversationRegenerate,
             "transcript:read" => Self::TranscriptRead,
             "transcript:append" => Self::TranscriptAppend,
+            "transcript:append_agent" => Self::TranscriptAppendAgent,
             "turn:create" => Self::TurnCreate,
             "turn:read" => Self::TurnRead,
             "turn:update" => Self::TurnUpdate,
@@ -324,6 +404,19 @@ impl Permission {
             "file:grant" => Self::FileGrant,
             _ => return None,
         })
+    }
+
+    fn allowed_for_delegated(&self) -> bool {
+        matches!(
+            self,
+            Self::TranscriptRead
+                | Self::TranscriptAppendAgent
+                | Self::TurnRead
+                | Self::TurnUpdate
+                | Self::ContinuationRead
+                | Self::ContinuationWrite
+                | Self::FileRead
+        )
     }
 }
 
@@ -353,6 +446,9 @@ fn trusted_headers(headers: &HeaderMap) -> Result<AuthContext, ApiError> {
         },
         client_id: "threadmark:trusted-headers".into(),
         agent_ref: None,
+        conversation_id: None,
+        turn_id: None,
+        token_kind: TokenKind::OwnerSession,
         permissions: OWNER_PERMISSIONS.into_iter().collect(),
     })
 }
@@ -385,6 +481,7 @@ mod tests {
             "https://issuer.example".into(),
             "threadmark-api".into(),
             300,
+            600,
             jwks,
         )
         .unwrap()
@@ -485,9 +582,35 @@ mod tests {
     }
 
     #[test]
-    fn rejects_delegated_tokens_until_resource_policy_is_implemented() {
+    fn accepts_only_fully_bound_delegated_tokens() {
         let mut claims = claims();
         claims["token_kind"] = json!("delegated_agent");
+        claims["conversation_id"] = json!("conv_1");
+        claims["turn_id"] = json!("turn_1");
+        claims["agent_ref"] = json!("agent/prod");
+        claims["permissions"] = json!(["transcript:append_agent"]);
+        let context = verifier().authenticate(&headers(&claims)).unwrap();
+        assert_eq!(
+            context.delegated_bounds(),
+            Some(("conv_1", "turn_1", "agent/prod"))
+        );
+        assert!(context.require(Permission::TranscriptAppendAgent).is_ok());
+
+        claims.as_object_mut().unwrap().remove("turn_id");
+        assert!(matches!(
+            verifier().authenticate(&headers(&claims)),
+            Err(ApiError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn rejects_owner_permissions_on_delegated_tokens() {
+        let mut claims = claims();
+        claims["token_kind"] = json!("delegated_agent");
+        claims["conversation_id"] = json!("conv_1");
+        claims["turn_id"] = json!("turn_1");
+        claims["agent_ref"] = json!("agent/prod");
+        claims["permissions"] = json!(["transcript:append"]);
         assert!(matches!(
             verifier().authenticate(&headers(&claims)),
             Err(ApiError::Unauthorized)

@@ -120,6 +120,7 @@ mod tests {
             auth_audience: None,
             auth_jwks_url: None,
             auth_max_owner_token_seconds: 300,
+            auth_max_delegated_token_seconds: 600,
         }))
     }
 

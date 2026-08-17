@@ -27,6 +27,7 @@ pub struct Inner {
     pub auth_audience: Option<String>,
     pub auth_jwks_url: Option<String>,
     pub auth_max_owner_token_seconds: u64,
+    pub auth_max_delegated_token_seconds: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +101,11 @@ impl Config {
             auth_max_owner_token_seconds > 0,
             "AUTH_MAX_OWNER_TOKEN_SECONDS must be greater than zero"
         );
+        let auth_max_delegated_token_seconds = parse("AUTH_MAX_DELEGATED_TOKEN_SECONDS", "600")?;
+        ensure!(
+            auth_max_delegated_token_seconds > 0,
+            "AUTH_MAX_DELEGATED_TOKEN_SECONDS must be greater than zero"
+        );
         let direct_upload_enabled = std::env::var("DIRECT_UPLOAD_ENABLED")
             .unwrap_or_else(|_| "false".into())
             .parse()
@@ -154,6 +160,7 @@ impl Config {
             auth_audience,
             auth_jwks_url,
             auth_max_owner_token_seconds,
+            auth_max_delegated_token_seconds,
         })))
     }
 }
