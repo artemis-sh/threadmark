@@ -1,8 +1,9 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
-use serde::Serialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 
 use crate::{
     api::AppState,
@@ -12,8 +13,10 @@ use crate::{
     ids::new_id,
     model::{
         Actor, AppendItems, AppendResult, Continuation, Conversation, CreateContinuation,
-        CreateConversation, CreateTurn, FileDelivery, Item, ReplayRequest, ReplayResult, StartTurn,
-        StartTurnResult, Turn, UpdateConversation, UpdateTurn,
+        CreateConversation, CreateTurn, FileDelivery, Item, ReplayRequest, ReplayResult,
+        STORED_RESPONSE_MAX_BYTES, STORED_RESPONSE_SCHEMA, StartTurn, StartTurnResult,
+        StoreResponse, StrictJson, Turn, UpdateConversation, UpdateTurn,
+        validate_json_number_tokens,
     },
 };
 
@@ -624,6 +627,20 @@ fn turn_start_lock_key(tenant: &str, owner: &str, client: &str, key: &str) -> i6
     )
 }
 
+fn stored_response_lock_key(tenant: &str, owner: &str, agent: &str, response_id: &str) -> i64 {
+    let mut digest = Sha256::new();
+    digest.update(b"threadmark:stored-response-lock:v1\0");
+    for value in [tenant, owner, agent, response_id] {
+        digest.update((value.len() as u32).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    i64::from_be_bytes(
+        digest.finalize()[..8]
+            .try_into()
+            .expect("eight digest bytes"),
+    )
+}
+
 #[cfg(test)]
 mod turn_start_tests {
     use super::turn_start_lock_key;
@@ -1205,12 +1222,14 @@ pub async fn create_continuation(
     }
     let result = sqlx::query_as::<_, Continuation>(
         "INSERT INTO continuations
-         (id, tenant_id, conversation_id, agent_ref, response_id, parent_response_id, through_seq, state)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (tenant_id, agent_ref, response_id) DO NOTHING RETURNING *",
+         (id, tenant_id, owner_ref, conversation_id, agent_ref, response_id,
+          parent_response_id, through_seq, state)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (tenant_id, owner_ref, agent_ref, response_id) DO NOTHING RETURNING *",
     )
     .bind(new_id("cont"))
     .bind(&actor.tenant_id)
+    .bind(&actor.principal_id)
     .bind(conversation_id)
     .bind(request.agent_ref)
     .bind(request.response_id)
@@ -1229,10 +1248,9 @@ pub async fn get_continuation(
     agent_ref: &str,
 ) -> ApiResult<Continuation> {
     sqlx::query_as::<_, Continuation>(
-        "SELECT c.* FROM continuations c
-         JOIN conversations v ON v.id = c.conversation_id
-         WHERE c.response_id = $1 AND c.agent_ref = $2
-           AND c.tenant_id = $3 AND v.owner_ref = $4",
+        "SELECT * FROM continuations
+         WHERE response_id = $1 AND agent_ref = $2
+           AND tenant_id = $3 AND owner_ref = $4",
     )
     .bind(response_id)
     .bind(agent_ref)
@@ -1241,6 +1259,379 @@ pub async fn get_continuation(
     .fetch_optional(pool)
     .await?
     .ok_or_else(|| ApiError::NotFound("Continuation not found.".into()))
+}
+
+#[derive(Debug, FromRow)]
+struct StoredResponseRow {
+    tenant_id: String,
+    owner_ref: String,
+    agent_ref: String,
+    conversation_id: String,
+    turn_id: String,
+    response_id: String,
+    previous_response_id: Option<String>,
+    continuation_parent_response_id: Option<String>,
+    terminal_status: String,
+    public_response: Value,
+    public_response_text: String,
+    canonical_digest: Vec<u8>,
+    schema_marker: String,
+    canonical_size: i64,
+    through_seq: i64,
+    response_created_at: DateTime<Utc>,
+    terminal_at: DateTime<Utc>,
+    state: Option<Value>,
+}
+
+struct ValidatedResponse {
+    value: Value,
+    public_response_text: String,
+    response_id: String,
+    previous_response_id: Option<String>,
+    status: String,
+    digest: Vec<u8>,
+    size: i64,
+}
+
+fn validate_public_response(
+    raw: &serde_json::value::RawValue,
+    schema_marker: &str,
+) -> ApiResult<ValidatedResponse> {
+    if schema_marker != STORED_RESPONSE_SCHEMA {
+        return Err(ApiError::BadRequest(format!(
+            "schema_marker must be {STORED_RESPONSE_SCHEMA}"
+        )));
+    }
+    if raw.get().len() > STORED_RESPONSE_MAX_BYTES {
+        return Err(ApiError::PayloadTooLarge(format!(
+            "public_response exceeds {STORED_RESPONSE_MAX_BYTES} bytes"
+        )));
+    }
+    validate_json_number_tokens(raw.get().as_bytes())
+        .map_err(|error| ApiError::BadRequest(format!("invalid public_response JSON: {error}")))?;
+    let mut deserializer = serde_json::Deserializer::from_str(raw.get());
+    let StrictJson(value) = StrictJson::deserialize(&mut deserializer)
+        .map_err(|error| ApiError::BadRequest(format!("invalid public_response JSON: {error}")))?;
+    deserializer
+        .end()
+        .map_err(|error| ApiError::BadRequest(format!("invalid public_response JSON: {error}")))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| ApiError::BadRequest("public_response must be a JSON object".into()))?;
+    if object.get("object").and_then(Value::as_str) != Some("response") {
+        return Err(ApiError::BadRequest(
+            "public_response.object must be response".into(),
+        ));
+    }
+    let response_id = bounded_response_id(object.get("id"), "public_response.id")?;
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| matches!(*status, "completed" | "incomplete" | "failed" | "cancelled"))
+        .ok_or_else(|| ApiError::BadRequest("public_response.status must be terminal".into()))?
+        .to_owned();
+    let previous_response_id = match object.get("previous_response_id") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(bounded_response_id(
+            Some(value),
+            "public_response.previous_response_id",
+        )?),
+    };
+    let canonical = serde_json_canonicalizer::to_vec(&value)
+        .map_err(|error| ApiError::BadRequest(format!("invalid public_response JSON: {error}")))?;
+    if canonical.len() > STORED_RESPONSE_MAX_BYTES {
+        return Err(ApiError::PayloadTooLarge(format!(
+            "public_response exceeds {STORED_RESPONSE_MAX_BYTES} bytes"
+        )));
+    }
+    Ok(ValidatedResponse {
+        value,
+        public_response_text: raw.get().to_owned(),
+        response_id,
+        previous_response_id,
+        status,
+        digest: Sha256::digest(&canonical).to_vec(),
+        size: canonical.len() as i64,
+    })
+}
+
+fn bounded_response_id(value: Option<&Value>, field: &str) -> ApiResult<String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && value.chars().count() <= 200)
+        .map(str::to_owned)
+        .ok_or_else(|| ApiError::BadRequest(format!("{field} must contain 1 to 200 characters")))
+}
+
+pub async fn store_response(
+    pool: &PgPool,
+    actor: &Actor,
+    conversation_id: &str,
+    mut request: StoreResponse,
+) -> ApiResult<(bool, String)> {
+    request.agent_ref = request.agent_ref.trim().to_owned();
+    request.turn_id = request.turn_id.trim().to_owned();
+    if request.agent_ref.is_empty() || request.agent_ref.chars().count() > 200 {
+        return Err(ApiError::BadRequest(
+            "agent_ref must contain 1 to 200 characters".into(),
+        ));
+    }
+    if request.turn_id.is_empty() || request.turn_id.chars().count() > 200 {
+        return Err(ApiError::BadRequest(
+            "turn_id must contain 1 to 200 characters".into(),
+        ));
+    }
+    if request.terminal_at < request.response_created_at {
+        return Err(ApiError::BadRequest(
+            "terminal_at must not precede response_created_at".into(),
+        ));
+    }
+    let validated = validate_public_response(&request.public_response, &request.schema_marker)?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(stored_response_lock_key(
+            &actor.tenant_id,
+            &actor.principal_id,
+            &request.agent_ref,
+            &validated.response_id,
+        ))
+        .execute(&mut *tx)
+        .await?;
+    let conversation = lock_conversation(&mut tx, actor, conversation_id).await?;
+    let through_seq = request.through_seq.unwrap_or(conversation.next_seq - 1);
+    if through_seq < 0 || through_seq >= conversation.next_seq {
+        return Err(ApiError::BadRequest(
+            "through_seq is outside the conversation transcript".into(),
+        ));
+    }
+
+    let turn = sqlx::query_as::<_, (String, String, Option<String>, Option<DateTime<Utc>>)>(
+        "SELECT agent_ref, status, response_id, completed_at FROM turns
+         WHERE id = $1 AND conversation_id = $2 FOR UPDATE",
+    )
+    .bind(&request.turn_id)
+    .bind(conversation_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Turn not found.".into()))?;
+    if turn.0 != request.agent_ref
+        || turn.1 != validated.status
+        || turn.2.as_deref() != Some(validated.response_id.as_str())
+        || turn.3.is_none()
+    {
+        return Err(ApiError::BadRequest(
+            "public_response does not match the terminal turn".into(),
+        ));
+    }
+
+    if let Some(parent) = &validated.previous_response_id {
+        let parent_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM continuations
+             WHERE tenant_id = $1 AND owner_ref = $2 AND conversation_id = $3
+               AND agent_ref = $4 AND response_id = $5)",
+        )
+        .bind(&actor.tenant_id)
+        .bind(&actor.principal_id)
+        .bind(conversation_id)
+        .bind(&request.agent_ref)
+        .bind(parent)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !parent_exists {
+            return Err(ApiError::NotFound("Previous response not found.".into()));
+        }
+    }
+
+    let existing = sqlx::query_as::<_, StoredResponseRow>(
+        "SELECT response.tenant_id, response.owner_ref, response.agent_ref,
+                response.conversation_id, response.turn_id, response.response_id,
+                response.previous_response_id,
+                continuation.parent_response_id AS continuation_parent_response_id,
+                response.terminal_status,
+                response.public_response, response.public_response_text,
+                response.canonical_digest,
+                response.schema_marker, response.canonical_size, response.through_seq,
+                response.response_created_at, response.terminal_at, continuation.state
+         FROM stored_responses response
+         JOIN continuations continuation ON continuation.id = response.continuation_id
+         WHERE response.tenant_id = $1 AND response.owner_ref = $2
+           AND response.agent_ref = $3 AND response.response_id = $4",
+    )
+    .bind(&actor.tenant_id)
+    .bind(&actor.principal_id)
+    .bind(&request.agent_ref)
+    .bind(&validated.response_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(existing) = existing {
+        validate_stored_response_row(&existing, actor, &request.agent_ref)?;
+        let retry_through_seq = request.through_seq.unwrap_or(existing.through_seq);
+        let identical = existing.conversation_id == conversation_id
+            && existing.turn_id == request.turn_id
+            && existing.previous_response_id == validated.previous_response_id
+            && existing.terminal_status == validated.status
+            && existing.canonical_digest == validated.digest
+            && existing.schema_marker == request.schema_marker
+            && existing.canonical_size == validated.size
+            && existing.through_seq == retry_through_seq
+            && existing.response_created_at == request.response_created_at
+            && existing.terminal_at == request.terminal_at
+            && existing.state == request.state;
+        if !identical {
+            return Err(ApiError::Conflict(
+                "Response ID already stores a different terminal response.".into(),
+            ));
+        }
+        tx.commit().await?;
+        return Ok((true, existing.public_response_text));
+    }
+
+    let inserted_continuation_id = sqlx::query_scalar::<_, String>(
+        "INSERT INTO continuations
+         (id, tenant_id, owner_ref, conversation_id, turn_id, agent_ref,
+          response_id, parent_response_id, through_seq, state)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+          ON CONFLICT (tenant_id, owner_ref, agent_ref, response_id) DO NOTHING
+          RETURNING id",
+    )
+    .bind(new_id("cont"))
+    .bind(&actor.tenant_id)
+    .bind(&actor.principal_id)
+    .bind(conversation_id)
+    .bind(&request.turn_id)
+    .bind(&request.agent_ref)
+    .bind(&validated.response_id)
+    .bind(&validated.previous_response_id)
+    .bind(through_seq)
+    .bind(&request.state)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let continuation_id = if let Some(id) = inserted_continuation_id {
+        id
+    } else {
+        let existing = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                i64,
+                Option<Value>,
+            ),
+        >(
+            "SELECT id, conversation_id, turn_id, parent_response_id, through_seq, state
+             FROM continuations
+             WHERE tenant_id = $1 AND owner_ref = $2 AND agent_ref = $3
+               AND response_id = $4",
+        )
+        .bind(&actor.tenant_id)
+        .bind(&actor.principal_id)
+        .bind(&request.agent_ref)
+        .bind(&validated.response_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if existing.1 != conversation_id
+            || existing.2.as_deref() != Some(request.turn_id.as_str())
+            || existing.3 != validated.previous_response_id
+            || existing.4 != through_seq
+            || existing.5 != request.state
+        {
+            return Err(ApiError::Conflict(
+                "Response ID already stores a different continuation.".into(),
+            ));
+        }
+        existing.0
+    };
+    sqlx::query(
+        "INSERT INTO stored_responses
+         (id, tenant_id, owner_ref, agent_ref, conversation_id, turn_id,
+          continuation_id, response_id, previous_response_id, terminal_status,
+          public_response, public_response_text, canonical_digest, schema_marker, canonical_size,
+          through_seq, response_created_at, terminal_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
+    )
+    .bind(new_id("sresp"))
+    .bind(&actor.tenant_id)
+    .bind(&actor.principal_id)
+    .bind(&request.agent_ref)
+    .bind(conversation_id)
+    .bind(&request.turn_id)
+    .bind(continuation_id)
+    .bind(&validated.response_id)
+    .bind(&validated.previous_response_id)
+    .bind(&validated.status)
+    .bind(&validated.value)
+    .bind(&validated.public_response_text)
+    .bind(&validated.digest)
+    .bind(&request.schema_marker)
+    .bind(validated.size)
+    .bind(through_seq)
+    .bind(request.response_created_at)
+    .bind(request.terminal_at)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok((false, validated.public_response_text))
+}
+
+pub async fn get_stored_response(
+    pool: &PgPool,
+    actor: &Actor,
+    response_id: &str,
+    agent_ref: &str,
+) -> ApiResult<String> {
+    let row = sqlx::query_as::<_, StoredResponseRow>(
+        "SELECT response.tenant_id, response.owner_ref, response.agent_ref,
+                response.conversation_id, response.turn_id, response.response_id,
+                response.previous_response_id,
+                continuation.parent_response_id AS continuation_parent_response_id,
+                response.terminal_status,
+                response.public_response, response.public_response_text,
+                response.canonical_digest,
+                response.schema_marker, response.canonical_size, response.through_seq,
+                response.response_created_at, response.terminal_at, continuation.state
+         FROM stored_responses response
+         JOIN continuations continuation ON continuation.id = response.continuation_id
+         WHERE response.response_id = $1 AND response.agent_ref = $2
+           AND response.tenant_id = $3 AND response.owner_ref = $4",
+    )
+    .bind(response_id)
+    .bind(agent_ref)
+    .bind(&actor.tenant_id)
+    .bind(&actor.principal_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Response not found.".into()))?;
+
+    validate_stored_response_row(&row, actor, agent_ref)?;
+    Ok(row.public_response_text)
+}
+
+fn validate_stored_response_row(
+    row: &StoredResponseRow,
+    actor: &Actor,
+    agent_ref: &str,
+) -> ApiResult<()> {
+    let raw = serde_json::value::RawValue::from_string(row.public_response_text.clone())
+        .map_err(|_| ApiError::CorruptStoredResponse)?;
+    let validated = validate_public_response(&raw, &row.schema_marker)
+        .map_err(|_| ApiError::CorruptStoredResponse)?;
+    if row.tenant_id != actor.tenant_id
+        || row.owner_ref != actor.principal_id
+        || row.agent_ref != agent_ref
+        || row.response_id != validated.response_id
+        || row.previous_response_id != validated.previous_response_id
+        || row.continuation_parent_response_id != validated.previous_response_id
+        || row.terminal_status != validated.status
+        || row.canonical_digest != validated.digest
+        || row.canonical_size != validated.size
+        || row.public_response != validated.value
+        || row.response_created_at > row.terminal_at
+    {
+        return Err(ApiError::CorruptStoredResponse);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1353,5 +1744,79 @@ mod tests {
             referenced_file_ids(&value),
             vec!["file_document".to_owned(), "file_image".to_owned()]
         );
+    }
+
+    #[test]
+    fn validates_terminal_public_response_and_digest() {
+        let response = serde_json::value::RawValue::from_string(
+            r#"{"usage":{"output_tokens":4,"input_tokens":3},"output":[{"type":"message","id":"msg_1"}],"previous_response_id":null,"status":"completed","object":"response","id":"resp_123"}"#.into(),
+        )
+        .unwrap();
+        let validated = validate_public_response(&response, STORED_RESPONSE_SCHEMA).unwrap();
+        assert_eq!(validated.response_id, "resp_123");
+        assert_eq!(validated.status, "completed");
+        assert_eq!(validated.digest.len(), 32);
+        assert_eq!(validated.public_response_text, response.get());
+    }
+
+    #[test]
+    fn rejects_nonterminal_and_oversized_public_responses() {
+        let nonterminal = serde_json::value::to_raw_value(&json!({
+            "id": "resp_123",
+            "object": "response",
+            "status": "in_progress"
+        }))
+        .unwrap();
+        assert!(validate_public_response(&nonterminal, STORED_RESPONSE_SCHEMA).is_err());
+
+        let oversized = serde_json::value::to_raw_value(&json!({
+            "id": "resp_123",
+            "object": "response",
+            "status": "completed",
+            "output": "x".repeat(STORED_RESPONSE_MAX_BYTES)
+        }))
+        .unwrap();
+        assert!(matches!(
+            validate_public_response(&oversized, STORED_RESPONSE_SCHEMA),
+            Err(ApiError::PayloadTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn malformed_stored_response_is_an_internal_integrity_error() {
+        let now = Utc::now();
+        let row = StoredResponseRow {
+            tenant_id: "tenant-a".into(),
+            owner_ref: "owner-a".into(),
+            agent_ref: "agent-a".into(),
+            conversation_id: "conv-a".into(),
+            turn_id: "turn-a".into(),
+            response_id: "resp-a".into(),
+            previous_response_id: None,
+            continuation_parent_response_id: None,
+            terminal_status: "completed".into(),
+            public_response: json!({
+                "id": "resp-a",
+                "object": "response",
+                "status": "completed"
+            }),
+            public_response_text: r#"{"id":"resp-a","object":"response","status":"completed"}"#
+                .into(),
+            canonical_digest: vec![0; 32],
+            schema_marker: STORED_RESPONSE_SCHEMA.into(),
+            canonical_size: 1,
+            through_seq: 0,
+            response_created_at: now,
+            terminal_at: now,
+            state: None,
+        };
+        let actor = Actor {
+            tenant_id: "tenant-a".into(),
+            principal_id: "owner-a".into(),
+        };
+        assert!(matches!(
+            validate_stored_response_row(&row, &actor, "agent-a"),
+            Err(ApiError::CorruptStoredResponse)
+        ));
     }
 }

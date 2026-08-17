@@ -20,8 +20,9 @@ use crate::{
         Actor, AppendItems, AppendResult, Continuation, ContinuationQuery, Conversation,
         CreateContinuation, CreateConversation, CreateDownload, CreateTurn, DownloadDelivery,
         DownloadGrant, FileResponse, Item, ListConversationsQuery, ListItemsQuery,
-        RegenerateResult, ReplayRequest, ReplayResult, StartTurn, StartTurnResult, StrictJson,
-        TruncateConversation, Turn, UpdateConversation, UpdateTurn, validate_json_number_tokens,
+        RegenerateResult, ReplayRequest, ReplayResult, StartTurn, StartTurnResult, StoreResponse,
+        StrictJson, TruncateConversation, Turn, UpdateConversation, UpdateTurn,
+        validate_json_number_tokens,
     },
     object_store::ObjectStore,
     store, uploads,
@@ -73,6 +74,11 @@ pub fn router(state: AppState) -> Router {
             post(create_continuation),
         )
         .route("/v1/continuations/{response_id}", get(get_continuation))
+        .route(
+            "/v1/conversations/{id}/responses",
+            post(store_response).layer(DefaultBodyLimit::max(2 * 1024 * 1024)),
+        )
+        .route("/v1/responses/{response_id}", get(get_response))
         .route("/v1/files", post(upload_file))
         .route("/v1/file-uploads", post(initiate_file_upload))
         .route("/v1/file-uploads/{id}/complete", post(complete_file_upload))
@@ -294,6 +300,7 @@ async fn create_continuation(
     Json(request): Json<CreateContinuation>,
 ) -> ApiResult<(StatusCode, Json<Continuation>)> {
     auth.require(Permission::ContinuationWrite)?;
+    auth.require_agent(request.agent_ref.trim())?;
     Ok((
         StatusCode::CREATED,
         Json(store::create_continuation(&state.pool, &auth, &id, request).await?),
@@ -307,9 +314,68 @@ async fn get_continuation(
     Query(query): Query<ContinuationQuery>,
 ) -> ApiResult<Json<Continuation>> {
     auth.require(Permission::ContinuationRead)?;
+    auth.require_agent(query.agent_ref.trim())
+        .map_err(|_| ApiError::NotFound("Continuation not found.".into()))?;
     Ok(Json(
         store::get_continuation(&state.pool, &auth, &response_id, &query.agent_ref).await?,
     ))
+}
+
+async fn store_response(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<Response> {
+    auth.require(Permission::ContinuationWrite)?;
+    let request = parse_store_response(&body)?;
+    auth.require_agent(request.agent_ref.trim())?;
+    let (replayed, response) = store::store_response(&state.pool, &auth, &id, request).await?;
+    public_json_response(
+        if replayed {
+            StatusCode::OK
+        } else {
+            StatusCode::CREATED
+        },
+        response,
+    )
+}
+
+async fn get_response(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(response_id): Path<String>,
+    Query(query): Query<ContinuationQuery>,
+) -> ApiResult<Response> {
+    auth.require(Permission::ContinuationRead)?;
+    auth.require_agent(query.agent_ref.trim())
+        .map_err(|_| ApiError::NotFound("Response not found.".into()))?;
+    public_json_response(
+        StatusCode::OK,
+        store::get_stored_response(&state.pool, &auth, &response_id, query.agent_ref.trim())
+            .await?,
+    )
+}
+
+fn parse_store_response(body: &[u8]) -> ApiResult<StoreResponse> {
+    validate_json_number_tokens(body)
+        .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?;
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let StrictJson(_value) = StrictJson::deserialize(&mut deserializer)
+        .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?;
+    deserializer
+        .end()
+        .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?;
+    serde_json::from_slice(body)
+        .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))
+}
+
+fn public_json_response(status: StatusCode, body: String) -> ApiResult<Response> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .map_err(|_| ApiError::CorruptStoredResponse)
 }
 
 async fn truncate_conversation(

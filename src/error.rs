@@ -27,6 +27,8 @@ pub enum ApiError {
     PayloadTooLarge(String),
     #[error("object storage operation failed")]
     ObjectStore(#[source] anyhow::Error),
+    #[error("stored response failed integrity validation")]
+    CorruptStoredResponse,
     #[error("database operation failed")]
     Database(#[from] sqlx::Error),
 }
@@ -47,13 +49,19 @@ impl IntoResponse for ApiError {
                 tracing::error!(?error, "object storage request failed");
                 (StatusCode::BAD_GATEWAY, "object_store_error")
             }
+            Self::CorruptStoredResponse => {
+                tracing::error!("stored response failed integrity validation");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+            }
             Self::Database(error) => {
                 tracing::error!(?error, "database request failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
             }
         };
         let message = match self {
-            Self::Database(_) | Self::ObjectStore(_) => "Storage operation failed.".to_owned(),
+            Self::Database(_) | Self::ObjectStore(_) | Self::CorruptStoredResponse => {
+                "Storage operation failed.".to_owned()
+            }
             other => other.to_string(),
         };
         let mut response = (

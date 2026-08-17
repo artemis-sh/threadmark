@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, de};
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Number, Value, value::RawValue};
 use sqlx::FromRow;
 use std::str::FromStr;
 
@@ -377,7 +377,9 @@ pub struct RegenerateResult {
 pub struct Continuation {
     pub id: String,
     pub tenant_id: String,
+    pub owner_ref: String,
     pub conversation_id: String,
+    pub turn_id: Option<String>,
     pub agent_ref: String,
     pub response_id: String,
     pub parent_response_id: Option<String>,
@@ -398,6 +400,26 @@ pub struct CreateContinuation {
 #[derive(Debug, Deserialize)]
 pub struct ContinuationQuery {
     pub agent_ref: String,
+}
+
+pub const STORED_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
+pub const STORED_RESPONSE_SCHEMA: &str = "open-responses/public-response/v1";
+
+#[derive(Debug, Deserialize)]
+pub struct StoreResponse {
+    pub agent_ref: String,
+    pub turn_id: String,
+    pub through_seq: Option<i64>,
+    pub state: Option<Value>,
+    #[serde(default = "stored_response_schema")]
+    pub schema_marker: String,
+    pub response_created_at: DateTime<Utc>,
+    pub terminal_at: DateTime<Utc>,
+    pub public_response: Box<RawValue>,
+}
+
+fn stored_response_schema() -> String {
+    STORED_RESPONSE_SCHEMA.to_owned()
 }
 
 #[derive(Debug, Serialize, FromRow)]
