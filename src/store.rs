@@ -1270,15 +1270,16 @@ pub async fn finalize_turn(
     ) {
         return Err(ApiError::BadRequest("status must be terminal".into()));
     }
-    if request.output_items.len() > 100
-        || request.output_items.iter().any(|item| !item.is_object())
+    if request.output_items.len() > 100 || request.output_items.iter().any(|item| !item.is_object())
     {
         return Err(ApiError::BadRequest(
             "output_items must contain at most 100 JSON objects".into(),
         ));
     }
     if !request.response.is_object() {
-        return Err(ApiError::BadRequest("response must be a JSON object".into()));
+        return Err(ApiError::BadRequest(
+            "response must be a JSON object".into(),
+        ));
     }
     if request
         .parent_response_id
@@ -1347,18 +1348,17 @@ pub async fn finalize_turn(
             .bind(turn_id)
             .fetch_one(&mut *tx)
             .await?;
-        let continuation = sqlx::query_as::<_, Continuation>(
-            "SELECT * FROM continuations WHERE id = $1",
-        )
-        .bind(continuation_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| {
-            coded_conflict(
-                "idempotency_result_deleted",
-                "the original finalization result is no longer available",
-            )
-        })?;
+        let continuation =
+            sqlx::query_as::<_, Continuation>("SELECT * FROM continuations WHERE id = $1")
+                .bind(continuation_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    coded_conflict(
+                        "idempotency_result_deleted",
+                        "the original finalization result is no longer available",
+                    )
+                })?;
         let items = if last_seq < first_seq {
             Vec::new()
         } else {

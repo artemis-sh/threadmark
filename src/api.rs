@@ -21,8 +21,8 @@ use crate::{
         CreateContinuation, CreateConversation, CreateDownload, CreateTurn, DownloadDelivery,
         DownloadGrant, FileResponse, FinalizeTurn, FinalizeTurnResult, Item,
         ListConversationsQuery, ListItemsQuery, RegenerateResult, ReplayRequest, ReplayResult,
-        StartTurn, StartTurnResult, StrictJson,
-        TruncateConversation, Turn, UpdateConversation, UpdateTurn, validate_json_number_tokens,
+        StartTurn, StartTurnResult, StrictJson, TruncateConversation, Turn, UpdateConversation,
+        UpdateTurn, validate_json_number_tokens,
     },
     object_store::ObjectStore,
     store, uploads,
@@ -298,7 +298,9 @@ async fn finalize_turn(
     auth.require(Permission::TranscriptAppend)?;
     auth.require(Permission::TurnUpdate)?;
     auth.require(Permission::ContinuationWrite)?;
-    Ok(Json(store::finalize_turn(&state.pool, &auth, &id, request).await?))
+    Ok(Json(
+        store::finalize_turn(&state.pool, &auth, &id, request).await?,
+    ))
 }
 
 async fn create_continuation(
