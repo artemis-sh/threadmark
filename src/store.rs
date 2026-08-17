@@ -1221,15 +1221,19 @@ pub async fn update_turn(
     ) {
         return Err(ApiError::BadRequest("invalid turn status".into()));
     }
-    let terminal = matches!(
+    if matches!(
         request.status.as_str(),
         "completed" | "incomplete" | "failed" | "cancelled"
-    );
+    ) {
+        return Err(ApiError::BadRequest(
+            "terminal turn statuses must be set through the finalization endpoint".into(),
+        ));
+    }
     sqlx::query_as::<_, Turn>(
         "UPDATE turns SET status = $1, response_id = $2, error = $3, usage = $4,
-              completed_at = CASE WHEN $5 THEN COALESCE(completed_at, now()) ELSE NULL END
-          WHERE id = $6 AND conversation_id IN
-              (SELECT id FROM conversations WHERE tenant_id = $7 AND owner_ref = $8)
+               completed_at = NULL
+          WHERE id = $5 AND conversation_id IN
+              (SELECT id FROM conversations WHERE tenant_id = $6 AND owner_ref = $7)
             AND status IN ('pending', 'streaming')
           RETURNING *",
     )
@@ -1237,7 +1241,6 @@ pub async fn update_turn(
     .bind(request.response_id)
     .bind(request.error)
     .bind(request.usage)
-    .bind(terminal)
     .bind(turn_id)
     .bind(&actor.tenant_id)
     .bind(&actor.principal_id)
