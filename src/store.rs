@@ -1003,7 +1003,8 @@ fn validate_agent_text_item(item: &Value) -> ApiResult<()> {
         } else {
             &["type", "text", "annotations"]
         };
-        part.keys().any(|field| !allowed_fields.contains(&field.as_str()))
+        part.keys()
+            .any(|field| !allowed_fields.contains(&field.as_str()))
             || part.get("type").and_then(Value::as_str) != Some(expected_part)
             || part.get("text").and_then(Value::as_str).is_none()
     }) {
@@ -1591,7 +1592,10 @@ mod tests {
         assert!(build_agent_projection(vec![(1, item.clone())], &[], 1, usize::MAX).is_ok());
         assert!(matches!(
             build_agent_projection(vec![(1, item)], &[], 0, usize::MAX),
-            Err(ApiError::CodedPayloadTooLarge { code: "context_limit_exceeded", .. })
+            Err(ApiError::CodedPayloadTooLarge {
+                code: "context_limit_exceeded",
+                ..
+            })
         ));
     }
 
@@ -1607,7 +1611,10 @@ mod tests {
         assert!(build_agent_projection(vec![(1, item.clone())], &[], 1, exact).is_ok());
         assert!(matches!(
             build_agent_projection(vec![(1, item)], &[], 1, exact - 1),
-            Err(ApiError::CodedPayloadTooLarge { code: "context_limit_exceeded", .. })
+            Err(ApiError::CodedPayloadTooLarge {
+                code: "context_limit_exceeded",
+                ..
+            })
         ));
     }
 
@@ -1642,7 +1649,10 @@ mod tests {
         ] {
             assert!(matches!(
                 build_agent_projection(vec![(1, item)], &[], 1, usize::MAX),
-                Err(ApiError::CodedBadRequest { code: "unsupported_agent_replay_item", .. })
+                Err(ApiError::CodedBadRequest {
+                    code: "unsupported_agent_replay_item",
+                    ..
+                })
             ));
         }
     }

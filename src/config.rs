@@ -104,8 +104,7 @@ impl Config {
             auth_max_owner_token_seconds > 0,
             "AUTH_MAX_OWNER_TOKEN_SECONDS must be greater than zero"
         );
-        let auth_max_delegated_token_seconds =
-            parse("AUTH_MAX_DELEGATED_TOKEN_SECONDS", "600")?;
+        let auth_max_delegated_token_seconds = parse("AUTH_MAX_DELEGATED_TOKEN_SECONDS", "600")?;
         ensure!(
             auth_max_delegated_token_seconds > 0,
             "AUTH_MAX_DELEGATED_TOKEN_SECONDS must be greater than zero"
@@ -122,15 +121,14 @@ impl Config {
             agent_replay_max_bytes > 0,
             "AGENT_REPLAY_MAX_BYTES must be greater than zero"
         );
-        let agent_replay_strip_top_level_fields = std::env::var(
-            "AGENT_REPLAY_STRIP_TOP_LEVEL_FIELDS",
-        )
-        .unwrap_or_else(|_| "id".into())
-        .split(',')
-        .map(str::trim)
-        .filter(|field| !field.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+        let agent_replay_strip_top_level_fields =
+            std::env::var("AGENT_REPLAY_STRIP_TOP_LEVEL_FIELDS")
+                .unwrap_or_else(|_| "id".into())
+                .split(',')
+                .map(str::trim)
+                .filter(|field| !field.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
         let mut unique_fields = agent_replay_strip_top_level_fields.clone();
         unique_fields.sort();
         unique_fields.dedup();
