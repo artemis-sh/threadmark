@@ -48,9 +48,7 @@ impl IntoResponse for ApiError {
             Self::CodedGone { code, .. } => (StatusCode::GONE, *code),
             Self::CodedUnavailable { code, .. } => (StatusCode::SERVICE_UNAVAILABLE, *code),
             Self::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
-            Self::CodedPayloadTooLarge { code, .. } => {
-                (StatusCode::PAYLOAD_TOO_LARGE, *code)
-            }
+            Self::CodedPayloadTooLarge { code, .. } => (StatusCode::PAYLOAD_TOO_LARGE, *code),
             Self::ObjectStore(error) => {
                 tracing::error!(?error, "object storage request failed");
                 (StatusCode::BAD_GATEWAY, "object_store_error")
