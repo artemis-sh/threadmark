@@ -140,8 +140,14 @@ mode. Production uses
 `AUTH_MODE=jwt` with `AUTH_ISSUER`, `AUTH_AUDIENCE`, and an HTTPS
 `AUTH_JWKS_URL`. JWT mode accepts Ed25519 `at+jwt` owner-session tokens and
 derives tenant, principal, and endpoint permissions exclusively from verified
-claims. Delegated-agent tokens remain rejected until their resource-bound write
-invariants are implemented.
+claims. Owner tokens may live for at most `AUTH_MAX_OWNER_TOKEN_SECONDS`.
+
+Delegated writes use an Ed25519 `at+jwt` with `token_kind=delegated_agent`, the
+`transcript:append_agent` permission, and required `conversation_id`, `turn_id`,
+and `agent_ref` claims. The signed tenant and principal remain the owner bounds.
+Delegated tokens may live for at most `AUTH_MAX_DELEGATED_TOKEN_SECONDS` (600 by
+default). Other recognized delegated permissions are reserved until their
+resource-bound routes are enabled.
 
 An agent called by Parley can receive a short-lived token scoped to the same
 tenant, principal, conversation, turn, and agent deployment. That authorization
@@ -183,6 +189,29 @@ curl -sS http://localhost:8090/v1/conversations/conv_.../items \
     "items":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Plan a weekend in Lisbon"}]}]
   }'
 ```
+
+A delegated agent writes to the same endpoint with its bearer token. Its body
+must use `source: "agent"` and the token's exact turn. New writes are accepted
+only while that turn is `pending` or `streaming`. The initial output allowlist
+is deliberately narrow:
+
+- assistant `message` items whose content consists only of string
+  `output_text` and/or `refusal` parts;
+- `reasoning` items with `summary_text` summary parts, optional
+  `reasoning_text` content parts, and optional string `encrypted_content`;
+- `function_call` items with string `call_id`, `name`, and `arguments`.
+
+User/system message roles, input parts (including `function_call_output`),
+unknown item types, roles on non-message items, malformed fields, duplicate JSON
+keys, non-canonical numbers, and new `threadmark://files/...` references are
+rejected. Supporting another protocol output type requires adding it to this
+versioned allowlist.
+
+Delegated idempotency binds the ordered payloads and count to source, turn,
+conversation, owner, tenant, and agent. An exact retry returns the original item
+IDs plus explicit `first_seq` and `last_seq`; any changed retry returns
+`409` with `idempotency_key_reused`. A retry remains valid after the turn closes,
+but a new append to a terminal turn returns `409` with `turn_not_active`.
 
 Build protocol-ready replay input:
 
@@ -249,7 +278,10 @@ GET /v1/continuations/resp_abc?agent_ref=research-agent%2Fprod
 ## Design notes
 
 - `payload` is JSONB and remains protocol-owned. Threadmark only requires each
-  item to be a JSON object.
+  item to be a JSON object for owner-authorized generic appends. This behavior
+  is unchanged; only delegated appends use the strict output contract above.
+  Append responses now add `first_seq` and `last_seq`; existing `items` and
+  `replayed` fields retain their behavior.
 - Sequence numbers are allocated while locking the conversation row. Concurrent
   append requests therefore have deterministic, non-overlapping order.
 - Continuations are namespaced by tenant and `agent_ref`; the same response ID

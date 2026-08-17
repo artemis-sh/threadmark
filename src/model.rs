@@ -294,6 +294,8 @@ pub struct AppendItems {
 #[derive(Debug, Serialize)]
 pub struct AppendResult {
     pub items: Vec<Item>,
+    pub first_seq: i64,
+    pub last_seq: i64,
     pub replayed: bool,
 }
 

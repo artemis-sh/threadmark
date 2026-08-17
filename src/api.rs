@@ -212,12 +212,36 @@ async fn append_items(
     State(state): State<AppState>,
     auth: AuthContext,
     Path(id): Path<String>,
-    Json(request): Json<AppendItems>,
+    body: Bytes,
 ) -> ApiResult<Json<AppendResult>> {
-    auth.require(Permission::TranscriptAppend)?;
+    let request = if auth.is_delegated() {
+        auth.require(Permission::TranscriptAppendAgent)?;
+        parse_strict_json(&body)?
+    } else {
+        auth.require(Permission::TranscriptAppend)?;
+        serde_json::from_slice(&body)
+            .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?
+    };
     Ok(Json(
-        store::append_items(&state.pool, &auth, &id, request).await?,
+        if auth.is_delegated() {
+            store::append_delegated_items(&state.pool, &auth, &id, request).await?
+        } else {
+            store::append_items(&state.pool, &auth, &id, request).await?
+        },
     ))
+}
+
+fn parse_strict_json<T: serde::de::DeserializeOwned>(body: &[u8]) -> ApiResult<T> {
+    validate_json_number_tokens(body)
+        .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?;
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let StrictJson(value) = StrictJson::deserialize(&mut deserializer)
+        .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?;
+    deserializer
+        .end()
+        .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?;
+    serde_json::from_value(value)
+        .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))
 }
 
 async fn replay(

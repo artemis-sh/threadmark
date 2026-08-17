@@ -6,6 +6,7 @@ use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::{
     api::AppState,
+    auth::AuthContext,
     capability,
     error::{ApiError, ApiResult},
     files,
@@ -16,6 +17,19 @@ use crate::{
         StartTurnResult, Turn, UpdateConversation, UpdateTurn,
     },
 };
+
+#[derive(Serialize)]
+struct DelegatedAppendDigest<'a> {
+    operation: &'static str,
+    version: i16,
+    source: &'a str,
+    tenant_id: &'a str,
+    owner_ref: &'a str,
+    conversation_id: &'a str,
+    turn_id: Option<&'a str>,
+    agent_ref: &'a str,
+    items: &'a [Value],
+}
 
 #[derive(Serialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -77,6 +91,29 @@ fn turn_start_digest_v1(request: &StartTurn) -> ApiResult<Vec<u8>> {
     Ok(Sha256::digest(
         serde_json_canonicalizer::to_vec(&digest_input)
             .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?,
+    )
+    .to_vec())
+}
+
+fn delegated_append_digest_v1(
+    auth: &AuthContext,
+    conversation_id: &str,
+    agent_ref: &str,
+    request: &AppendItems,
+) -> ApiResult<Vec<u8>> {
+    Ok(Sha256::digest(
+        serde_json_canonicalizer::to_vec(&DelegatedAppendDigest {
+            operation: "delegated_append",
+            version: 1,
+            source: &request.source,
+            tenant_id: &auth.tenant_id,
+            owner_ref: &auth.principal_id,
+            conversation_id,
+            turn_id: request.turn_id.as_deref(),
+            agent_ref,
+            items: &request.items,
+        })
+        .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?,
     )
     .to_vec())
 }
@@ -694,6 +731,8 @@ pub async fn append_items(
         tx.commit().await?;
         return Ok(AppendResult {
             items,
+            first_seq,
+            last_seq,
             replayed: true,
         });
     }
@@ -786,8 +825,379 @@ pub async fn append_items(
     tx.commit().await?;
     Ok(AppendResult {
         items: inserted,
+        first_seq,
+        last_seq,
         replayed: false,
     })
+}
+
+pub async fn append_delegated_items(
+    pool: &PgPool,
+    auth: &AuthContext,
+    conversation_id: &str,
+    request: AppendItems,
+) -> ApiResult<AppendResult> {
+    let (bound_conversation, bound_turn, bound_agent) = auth
+        .delegated_bounds()
+        .ok_or(ApiError::Forbidden)?;
+    if conversation_id != bound_conversation {
+        return Err(ApiError::NotFound("Conversation not found.".into()));
+    }
+    if request.idempotency_key.trim().is_empty() || request.idempotency_key.len() > 200 {
+        return Err(ApiError::BadRequest(
+            "idempotency_key must contain 1 to 200 characters".into(),
+        ));
+    }
+
+    // Compute before protocol validation so every changed retry, including a
+    // changed source, turn, count, order, or payload, receives the same typed
+    // idempotency conflict instead of disclosing the original result.
+    let request_digest =
+        delegated_append_digest_v1(auth, conversation_id, bound_agent, &request)?;
+    let mut tx = pool.begin().await?;
+    let conversation = lock_conversation(&mut tx, auth, conversation_id).await?;
+    let (turn_agent, turn_status) = sqlx::query_as::<_, (String, String)>(
+        "SELECT agent_ref, status FROM turns
+         WHERE id = $1 AND conversation_id = $2 FOR UPDATE",
+    )
+    .bind(bound_turn)
+    .bind(conversation_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Turn not found.".into()))?;
+    if turn_agent != bound_agent {
+        return Err(ApiError::NotFound("Turn not found.".into()));
+    }
+
+    if let Some(
+        (
+            version,
+            digest,
+            source,
+            turn_id,
+            tenant_id,
+            owner_ref,
+            agent_ref,
+            item_count,
+            item_ids,
+            first_seq,
+            last_seq,
+        ),
+    ) = sqlx::query_as::<
+        _,
+        (
+            Option<i16>,
+            Option<Vec<u8>>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i32>,
+            Option<Vec<String>>,
+            i64,
+            i64,
+        ),
+    >(
+            "SELECT request_version, request_digest, source, turn_id, tenant_id, owner_ref,
+                    agent_ref, item_count, item_ids, first_seq, last_seq
+             FROM append_batches WHERE conversation_id = $1 AND idempotency_key = $2",
+        )
+    .bind(conversation_id)
+    .bind(&request.idempotency_key)
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        let exact = version == Some(1)
+            && digest.as_deref() == Some(request_digest.as_slice())
+            && source.as_deref() == Some("agent")
+            && turn_id.as_deref() == Some(bound_turn)
+            && tenant_id.as_deref() == Some(auth.tenant_id.as_str())
+            && owner_ref.as_deref() == Some(auth.principal_id.as_str())
+            && agent_ref.as_deref() == Some(bound_agent)
+            && item_count == i32::try_from(request.items.len()).ok()
+            && item_ids.as_ref().is_some_and(|ids| ids.len() == request.items.len());
+        if !exact {
+            return Err(coded_conflict(
+                "idempotency_key_reused",
+                "idempotency_key was already used for a different delegated append",
+            ));
+        }
+        let item_ids = item_ids.expect("exact delegated batch has item IDs");
+        let items = sqlx::query_as::<_, Item>(
+            "SELECT * FROM conversation_items
+             WHERE conversation_id = $1 AND turn_id = $2 AND source = 'agent'
+               AND id = ANY($3) AND seq BETWEEN $4 AND $5 ORDER BY seq ASC",
+        )
+        .bind(conversation_id)
+        .bind(bound_turn)
+        .bind(&item_ids)
+        .bind(first_seq)
+        .bind(last_seq)
+        .fetch_all(&mut *tx)
+        .await?;
+        if items.iter().map(|item| &item.id).ne(item_ids.iter()) {
+            return Err(coded_conflict(
+                "idempotency_result_deleted",
+                "the original delegated append result is no longer available",
+            ));
+        }
+        tx.commit().await?;
+        return Ok(AppendResult {
+            items,
+            first_seq,
+            last_seq,
+            replayed: true,
+        });
+    }
+
+    if request.source != "agent" {
+        return Err(ApiError::BadRequest(
+            "delegated writes require source agent".into(),
+        ));
+    }
+    if request.turn_id.as_deref() != Some(bound_turn) {
+        return Err(ApiError::NotFound("Turn not found.".into()));
+    }
+    if request.items.is_empty() || request.items.len() > 100 {
+        return Err(ApiError::BadRequest(
+            "items must contain between 1 and 100 entries".into(),
+        ));
+    }
+    for item in &request.items {
+        validate_delegated_output_item(item)?;
+        if !referenced_file_ids(item).is_empty() {
+            return Err(ApiError::BadRequest(
+                "delegated output cannot introduce threadmark file references".into(),
+            ));
+        }
+    }
+    if !matches!(turn_status.as_str(), "pending" | "streaming") {
+        return Err(coded_conflict(
+            "turn_not_active",
+            "delegated output can only be appended while the turn is active",
+        ));
+    }
+
+    let first_seq = conversation.next_seq;
+    let last_seq = first_seq
+        .checked_add(request.items.len() as i64 - 1)
+        .ok_or_else(|| ApiError::Conflict("Conversation sequence is exhausted.".into()))?;
+    let next_seq = last_seq
+        .checked_add(1)
+        .ok_or_else(|| ApiError::Conflict("Conversation sequence is exhausted.".into()))?;
+    let item_count = i32::try_from(request.items.len()).expect("batch limit fits i32");
+    let mut inserted = Vec::with_capacity(request.items.len());
+    for (offset, payload) in request.items.into_iter().enumerate() {
+        inserted.push(
+            sqlx::query_as::<_, Item>(
+                "INSERT INTO conversation_items
+                 (id, conversation_id, turn_id, seq, source, payload)
+                 VALUES ($1, $2, $3, $4, 'agent', $5) RETURNING *",
+            )
+            .bind(new_id("item"))
+            .bind(conversation_id)
+            .bind(bound_turn)
+            .bind(first_seq + offset as i64)
+            .bind(payload)
+            .fetch_one(&mut *tx)
+            .await?,
+        );
+    }
+    let item_ids = inserted
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    sqlx::query(
+        "INSERT INTO append_batches
+         (conversation_id, idempotency_key, first_seq, last_seq, request_version,
+          request_digest, source, turn_id, tenant_id, owner_ref, agent_ref, item_count, item_ids)
+         VALUES ($1, $2, $3, $4, 1, $5, 'agent', $6, $7, $8, $9, $10, $11)",
+    )
+    .bind(conversation_id)
+    .bind(request.idempotency_key)
+    .bind(first_seq)
+    .bind(last_seq)
+    .bind(request_digest)
+    .bind(bound_turn)
+    .bind(&auth.tenant_id)
+    .bind(&auth.principal_id)
+    .bind(bound_agent)
+    .bind(item_count)
+    .bind(item_ids)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE conversations SET next_seq = $2, updated_at = now() WHERE id = $1")
+        .bind(conversation_id)
+        .bind(next_seq)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(AppendResult {
+        items: inserted,
+        first_seq,
+        last_seq,
+        replayed: false,
+    })
+}
+
+fn validate_delegated_output_item(value: &Value) -> ApiResult<()> {
+    let object = value.as_object().ok_or_else(|| {
+        ApiError::BadRequest("each delegated output item must be a JSON object".into())
+    })?;
+    let item_type = object.get("type").and_then(Value::as_str).ok_or_else(|| {
+        ApiError::BadRequest("each delegated output item requires a string type".into())
+    })?;
+    if object
+        .iter()
+        .any(|(key, value)| key != "role" && contains_role_field(value))
+    {
+        return Err(ApiError::BadRequest(
+            "delegated output cannot contain nested roles".into(),
+        ));
+    }
+    if item_type != "message" && object.contains_key("role") {
+        return Err(ApiError::BadRequest(
+            "roles are only allowed on assistant message output".into(),
+        ));
+    }
+    if object.get("id").is_some_and(|value| !value.is_string()) {
+        return Err(ApiError::BadRequest(
+            "delegated output id must be a string".into(),
+        ));
+    }
+    if let Some(status) = object.get("status")
+        && !matches!(status.as_str(), Some("in_progress" | "completed" | "incomplete"))
+    {
+        return Err(ApiError::BadRequest(
+            "delegated output status is unsupported".into(),
+        ));
+    }
+    match item_type {
+        "message" => {
+            validate_known_fields(object, &["type", "id", "status", "role", "content"])?;
+            if object.get("role").and_then(Value::as_str) != Some("assistant") {
+                return Err(ApiError::BadRequest(
+                    "delegated message output requires role assistant".into(),
+                ));
+            }
+            let content = object.get("content").and_then(Value::as_array).ok_or_else(|| {
+                ApiError::BadRequest("delegated message output requires content array".into())
+            })?;
+            if content.is_empty() {
+                return Err(ApiError::BadRequest(
+                    "delegated message content cannot be empty".into(),
+                ));
+            }
+            for part in content {
+                let part = part.as_object().ok_or_else(|| {
+                    ApiError::BadRequest("delegated message content must contain objects".into())
+                })?;
+                match part.get("type").and_then(Value::as_str) {
+                    Some("output_text") if part.get("text").is_some_and(Value::is_string) => {
+                        validate_known_fields(
+                            part,
+                            &["type", "text", "annotations", "logprobs"],
+                        )?;
+                        for field in ["annotations", "logprobs"] {
+                            if part.get(field).is_some_and(|value| !value.is_array()) {
+                                return Err(ApiError::BadRequest(format!(
+                                    "output_text {field} must be an array"
+                                )));
+                            }
+                        }
+                    }
+                    Some("refusal") if part.get("refusal").is_some_and(Value::is_string) => {
+                        validate_known_fields(part, &["type", "refusal"])?;
+                    }
+                    _ => {
+                        return Err(ApiError::BadRequest(
+                            "delegated message content supports output_text and refusal only".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        "reasoning" => {
+            validate_known_fields(
+                object,
+                &["type", "id", "status", "summary", "content", "encrypted_content"],
+            )?;
+            validate_text_parts(object.get("summary"), "summary_text", "summary")?;
+            if let Some(content) = object.get("content") {
+                validate_text_parts(Some(content), "reasoning_text", "content")?;
+            }
+            if object
+                .get("encrypted_content")
+                .is_some_and(|value| !value.is_string())
+            {
+                return Err(ApiError::BadRequest(
+                    "reasoning encrypted_content must be a string".into(),
+                ));
+            }
+        }
+        "function_call" => {
+            validate_known_fields(
+                object,
+                &["type", "id", "status", "call_id", "name", "arguments"],
+            )?;
+            for field in ["call_id", "name", "arguments"] {
+                if !object.get(field).is_some_and(Value::is_string) {
+                    return Err(ApiError::BadRequest(format!(
+                        "delegated function_call requires string {field}"
+                    )));
+                }
+            }
+        }
+        _ => {
+            return Err(ApiError::BadRequest(format!(
+                "unsupported delegated output item type: {item_type}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_known_fields(
+    object: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+) -> ApiResult<()> {
+    if let Some(field) = object.keys().find(|field| !allowed.contains(&field.as_str())) {
+        return Err(ApiError::BadRequest(format!(
+            "unsupported delegated output field: {field}"
+        )));
+    }
+    Ok(())
+}
+
+fn contains_role_field(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(contains_role_field),
+        Value::Object(values) => {
+            values.contains_key("role") || values.values().any(contains_role_field)
+        }
+        _ => false,
+    }
+}
+
+fn validate_text_parts(value: Option<&Value>, part_type: &str, field: &str) -> ApiResult<()> {
+    let parts = value.and_then(Value::as_array).ok_or_else(|| {
+        ApiError::BadRequest(format!("reasoning {field} must be an array"))
+    })?;
+    for part in parts {
+        let part = part.as_object().ok_or_else(|| {
+            ApiError::BadRequest(format!("reasoning {field} must contain objects"))
+        })?;
+        validate_known_fields(part, &["type", "text"])?;
+        if part.get("type").and_then(Value::as_str) != Some(part_type)
+            || !part.get("text").is_some_and(Value::is_string)
+        {
+            return Err(ApiError::BadRequest(format!(
+                "reasoning {field} supports {part_type} text parts only"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn referenced_file_ids(value: &Value) -> Vec<String> {
@@ -1099,7 +1509,13 @@ pub async fn truncate_conversation(
         .bind(seq)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM append_batches WHERE conversation_id = $1 AND last_seq >= $2")
+    // Keep delegated records as tombstones so their keys can never allocate a
+    // different result after truncation. Exact retries report that the original
+    // result was deleted. Legacy owner batches retain their historical behavior.
+    sqlx::query(
+        "DELETE FROM append_batches
+         WHERE conversation_id = $1 AND last_seq >= $2 AND request_version IS NULL",
+    )
         .bind(conversation_id)
         .bind(seq)
         .execute(&mut *tx)
@@ -1352,6 +1768,129 @@ mod tests {
         assert_eq!(
             referenced_file_ids(&value),
             vec!["file_document".to_owned(), "file_image".to_owned()]
+        );
+    }
+
+    #[test]
+    fn accepts_allowlisted_delegated_output_shapes() {
+        for item in [
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "done"},
+                    {"type": "refusal", "refusal": "cannot comply"}
+                ]
+            }),
+            json!({
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "summary"}],
+                "content": [{"type": "reasoning_text", "text": "reasoning"}],
+                "encrypted_content": "opaque"
+            }),
+            json!({
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "lookup",
+                "arguments": "{\"city\":\"Lisbon\"}"
+            }),
+        ] {
+            validate_delegated_output_item(&item).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_roles_input_parts_and_unknown_delegated_shapes() {
+        for item in [
+            json!({"type": "message", "role": "user", "content": [
+                {"type": "output_text", "text": "x"}
+            ]}),
+            json!({"type": "message", "role": "system", "content": [
+                {"type": "output_text", "text": "x"}
+            ]}),
+            json!({"type": "message", "role": "assistant", "content": [
+                {"type": "input_text", "text": "x"}
+            ]}),
+            json!({"type": "function_call_output", "call_id": "call_1", "output": "x"}),
+            json!({"type": "future_output", "role": "assistant"}),
+            json!({
+                "type": "function_call", "role": "assistant", "call_id": "call_1",
+                "name": "x", "arguments": "{}"
+            }),
+            json!({"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "x", "role": "user"}
+            ]}),
+            json!({"type": "message", "role": "assistant", "status": "queued", "content": [
+                {"type": "output_text", "text": "x"}
+            ]}),
+            json!({"type": "function_call", "call_id": "call_1", "name": "x", "arguments": "{}", "output": "injected"}),
+        ] {
+            assert!(
+                validate_delegated_output_item(&item).is_err(),
+                "accepted {item}"
+            );
+        }
+    }
+
+    #[test]
+    fn delegated_digest_binds_source_turn_order_payload_and_authorization() {
+        let auth = AuthContext::delegated_for_test(
+            "tenant-a",
+            "owner-a",
+            "conv-a",
+            "turn-a",
+            "agent-a",
+        );
+        let request = AppendItems {
+            idempotency_key: "retry-1".into(),
+            turn_id: Some("turn-a".into()),
+            source: "agent".into(),
+            items: vec![
+                json!({"type": "function_call", "call_id": "1", "name": "a", "arguments": "{}"}),
+                json!({"type": "function_call", "call_id": "2", "name": "b", "arguments": "{}"}),
+            ],
+        };
+        let original = delegated_append_digest_v1(&auth, "conv-a", "agent-a", &request).unwrap();
+
+        let mut changed = AppendItems {
+            items: request.items.iter().rev().cloned().collect(),
+            ..request
+        };
+        assert_ne!(
+            original,
+            delegated_append_digest_v1(&auth, "conv-a", "agent-a", &changed).unwrap()
+        );
+        changed.items.pop();
+        assert_ne!(
+            original,
+            delegated_append_digest_v1(&auth, "conv-a", "agent-a", &changed).unwrap()
+        );
+        changed.items[0]["name"] = json!("changed");
+        assert_ne!(
+            original,
+            delegated_append_digest_v1(&auth, "conv-a", "agent-a", &changed).unwrap()
+        );
+        changed.source = "system".into();
+        assert_ne!(
+            original,
+            delegated_append_digest_v1(&auth, "conv-a", "agent-a", &changed).unwrap()
+        );
+        changed.source = "agent".into();
+        changed.turn_id = Some("turn-b".into());
+        assert_ne!(
+            original,
+            delegated_append_digest_v1(&auth, "conv-a", "agent-a", &changed).unwrap()
+        );
+        assert_ne!(
+            original,
+            delegated_append_digest_v1(&auth, "conv-b", "agent-a", &changed).unwrap()
+        );
+        let other_auth = AuthContext::delegated_for_test(
+            "tenant-b", "owner-b", "conv-a", "turn-a", "agent-b",
+        );
+        assert_ne!(
+            original,
+            delegated_append_digest_v1(&other_auth, "conv-a", "agent-b", &changed).unwrap()
         );
     }
 }
