@@ -1,5 +1,12 @@
 ALTER TABLE turns ADD COLUMN reserved_response_id text;
 
+-- Preserve response IDs already assigned to active turns before this
+-- migration. Legacy active turns without one can reserve their response ID
+-- during their first transactional finalization.
+UPDATE turns
+SET reserved_response_id = response_id
+WHERE status IN ('pending', 'streaming') AND response_id IS NOT NULL;
+
 CREATE TABLE turn_finalizations (
     turn_id text PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
     tenant_id text NOT NULL,

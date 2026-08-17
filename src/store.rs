@@ -119,6 +119,13 @@ fn turn_finalize_digest_v1(request: &FinalizeTurn) -> ApiResult<Vec<u8>> {
     .to_vec())
 }
 
+fn response_id_is_reserved_or_legacy(
+    reserved_response_id: Option<&str>,
+    response_id: &str,
+) -> bool {
+    reserved_response_id.is_none_or(|reserved| reserved == response_id)
+}
+
 pub async fn create_conversation(
     pool: &PgPool,
     actor: &Actor,
@@ -1388,7 +1395,13 @@ pub async fn finalize_turn(
         });
     }
 
-    if reserved_response_id.as_deref() != Some(request.response_id.as_str()) {
+    // Turns created before reserved_response_id was introduced have no value
+    // here. Their first finalization establishes the response ID atomically
+    // with the terminal turn update and finalization record below.
+    if !response_id_is_reserved_or_legacy(
+        reserved_response_id.as_deref(),
+        request.response_id.as_str(),
+    ) {
         return Err(coded_conflict(
             "response_id_mismatch",
             "response_id does not match the response ID reserved for this turn",
@@ -1510,8 +1523,9 @@ pub async fn finalize_turn(
         .execute(&mut *tx)
         .await?;
     let turn = sqlx::query_as::<_, Turn>(
-        "UPDATE turns SET status = $1, response_id = $2, error = $3, usage = $4,
-         completed_at = COALESCE(completed_at, now()) WHERE id = $5 RETURNING *",
+        "UPDATE turns SET status = $1, response_id = $2, reserved_response_id = $2,
+         error = $3, usage = $4, completed_at = COALESCE(completed_at, now())
+         WHERE id = $5 RETURNING *",
     )
     .bind(&request.status)
     .bind(&request.response_id)
@@ -1749,5 +1763,12 @@ mod tests {
         changed.status = "completed".into();
         changed.response["status"] = json!("incomplete");
         assert_ne!(original, turn_finalize_digest_v1(&changed).unwrap());
+    }
+
+    #[test]
+    fn legacy_turns_can_finalize_with_their_first_response_id() {
+        assert!(response_id_is_reserved_or_legacy(None, "resp_1"));
+        assert!(response_id_is_reserved_or_legacy(Some("resp_1"), "resp_1"));
+        assert!(!response_id_is_reserved_or_legacy(Some("resp_1"), "resp_2"));
     }
 }
