@@ -330,8 +330,7 @@ async fn store_response(
     auth.require(Permission::ContinuationWrite)?;
     let request = parse_store_response(&body)?;
     auth.require_agent(request.agent_ref.trim())?;
-    let (replayed, response) =
-        store::store_response(&state.pool, &auth, &id, request).await?;
+    let (replayed, response) = store::store_response(&state.pool, &auth, &id, request).await?;
     public_json_response(
         if replayed {
             StatusCode::OK
@@ -353,13 +352,8 @@ async fn get_response(
         .map_err(|_| ApiError::NotFound("Response not found.".into()))?;
     public_json_response(
         StatusCode::OK,
-        store::get_stored_response(
-            &state.pool,
-            &auth,
-            &response_id,
-            query.agent_ref.trim(),
-        )
-        .await?,
+        store::get_stored_response(&state.pool, &auth, &response_id, query.agent_ref.trim())
+            .await?,
     )
 }
 

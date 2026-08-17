@@ -1315,9 +1315,9 @@ fn validate_public_response(
     deserializer
         .end()
         .map_err(|error| ApiError::BadRequest(format!("invalid public_response JSON: {error}")))?;
-    let object = value.as_object().ok_or_else(|| {
-        ApiError::BadRequest("public_response must be a JSON object".into())
-    })?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| ApiError::BadRequest("public_response must be a JSON object".into()))?;
     if object.get("object").and_then(Value::as_str) != Some("response") {
         return Err(ApiError::BadRequest(
             "public_response.object must be response".into(),
@@ -1511,7 +1511,14 @@ pub async fn store_response(
     } else {
         let existing = sqlx::query_as::<
             _,
-            (String, String, Option<String>, Option<String>, i64, Option<Value>),
+            (
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                i64,
+                Option<Value>,
+            ),
         >(
             "SELECT id, conversation_id, turn_id, parent_response_id, through_seq, state
              FROM continuations
@@ -1793,8 +1800,8 @@ mod tests {
                 "object": "response",
                 "status": "completed"
             }),
-            public_response_text:
-                r#"{"id":"resp-a","object":"response","status":"completed"}"#.into(),
+            public_response_text: r#"{"id":"resp-a","object":"response","status":"completed"}"#
+                .into(),
             canonical_digest: vec![0; 32],
             schema_marker: STORED_RESPONSE_SCHEMA.into(),
             canonical_size: 1,
