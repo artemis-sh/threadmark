@@ -101,8 +101,7 @@ impl Config {
             auth_max_owner_token_seconds > 0,
             "AUTH_MAX_OWNER_TOKEN_SECONDS must be greater than zero"
         );
-        let auth_max_delegated_token_seconds =
-            parse("AUTH_MAX_DELEGATED_TOKEN_SECONDS", "600")?;
+        let auth_max_delegated_token_seconds = parse("AUTH_MAX_DELEGATED_TOKEN_SECONDS", "600")?;
         ensure!(
             auth_max_delegated_token_seconds > 0,
             "AUTH_MAX_DELEGATED_TOKEN_SECONDS must be greater than zero"

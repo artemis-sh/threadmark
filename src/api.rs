@@ -222,13 +222,11 @@ async fn append_items(
         serde_json::from_slice(&body)
             .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?
     };
-    Ok(Json(
-        if auth.is_delegated() {
-            store::append_delegated_items(&state.pool, &auth, &id, request).await?
-        } else {
-            store::append_items(&state.pool, &auth, &id, request).await?
-        },
-    ))
+    Ok(Json(if auth.is_delegated() {
+        store::append_delegated_items(&state.pool, &auth, &id, request).await?
+    } else {
+        store::append_items(&state.pool, &auth, &id, request).await?
+    }))
 }
 
 fn parse_strict_json<T: serde::de::DeserializeOwned>(body: &[u8]) -> ApiResult<T> {

@@ -266,7 +266,10 @@ impl Claims {
             "owner_session"
                 if self.exp.saturating_sub(self.iat) <= verifier.max_owner_seconds
                     && self.conversation_id.is_none()
-                    && self.turn_id.is_none() => TokenKind::OwnerSession,
+                    && self.turn_id.is_none() =>
+            {
+                TokenKind::OwnerSession
+            }
             "delegated_agent"
                 if self.exp.saturating_sub(self.iat) <= verifier.max_delegated_seconds
                     && self.conversation_id.as_deref().is_some_and(valid_id)
