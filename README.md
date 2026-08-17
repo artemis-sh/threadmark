@@ -78,6 +78,7 @@ This is an experiment and its API is not stable. The current slice establishes:
 - Cursor-based item reads.
 - Open Responses replay projection with optional top-level `id` removal.
 - Agent-scoped continuation records and optional private checkpoint state.
+- Immutable terminal public responses with owner-scoped recovery by response ID.
 
 Editing, branching, retention, event delivery, production authentication, and
 fine-grained capabilities are intentionally deferred until the core contract is
@@ -226,6 +227,56 @@ The agent can resolve that state later with:
 GET /v1/continuations/resp_abc?agent_ref=research-agent%2Fprod
 ```
 
+### Store and recover a terminal response
+
+After completing the turn (including setting its `response_id` and terminal
+status), persist the exact public Open Responses object and its continuation in
+one transaction:
+
+```bash
+curl -sS http://localhost:8090/v1/conversations/conv_.../responses \
+  -H 'content-type: application/json' \
+  -H 'x-threadmark-tenant: acme' \
+  -H 'x-threadmark-principal: user_123' \
+  -d '{
+    "agent_ref":"research-agent/prod",
+    "turn_id":"turn_...",
+    "response_created_at":"2026-08-17T10:00:00Z",
+    "terminal_at":"2026-08-17T10:00:03Z",
+    "public_response":{
+      "id":"resp_abc",
+      "object":"response",
+      "status":"completed",
+      "previous_response_id":null,
+      "output":[],
+      "usage":{"input_tokens":10,"output_tokens":4}
+    },
+    "state":{"provider_thread":"thread_xyz"}
+  }'
+```
+
+`schema_marker` defaults to `open-responses/public-response/v1`, and
+`through_seq` defaults to the current transcript boundary. The response must be
+a terminal `object: "response"`, must match the terminal turn's agent, status,
+and response ID, and is limited to 1 MiB of canonical JSON. Duplicate keys,
+non-canonical JSON numbers, and unknown schema markers are rejected. An exact
+retry returns `200`; reusing the scoped response ID for different content or
+linkage returns `409`.
+
+Recover the public object without exposing private continuation state:
+
+```text
+GET /v1/responses/resp_abc?agent_ref=research-agent%2Fprod
+```
+
+The endpoint returns the validated stored JSON text itself, preserving object
+key order, array order, and JSON representation rather than projecting from
+ledger items. A JSONB validation copy, canonical SHA-256 digest, and versioned
+schema marker are verified on every read. Missing, wrong-owner, and wrong-agent
+lookups all return `404`; malformed stored data returns a generic `500` and is
+never served. Callers need `continuation:write` to store and
+`continuation:read` to retrieve responses.
+
 ## API summary
 
 | Method | Path | Purpose |
@@ -240,6 +291,8 @@ GET /v1/continuations/resp_abc?agent_ref=research-agent%2Fprod
 | `PATCH` | `/v1/turns/{id}` | Update turn state and outcome |
 | `POST` | `/v1/conversations/{id}/continuations` | Record an agent checkpoint |
 | `GET` | `/v1/continuations/{response_id}` | Resolve an agent checkpoint |
+| `POST` | `/v1/conversations/{id}/responses` | Atomically store a terminal public response and continuation |
+| `GET` | `/v1/responses/{response_id}` | Recover an owner- and agent-scoped public response |
 | `POST` | `/v1/files` | Upload a tenant-owned S3-backed file |
 | `GET` | `/v1/files/{id}` | Read owned file metadata |
 | `DELETE` | `/v1/files/{id}` | Delete an unreferenced owned file |
@@ -252,10 +305,18 @@ GET /v1/continuations/resp_abc?agent_ref=research-agent%2Fprod
   item to be a JSON object.
 - Sequence numbers are allocated while locking the conversation row. Concurrent
   append requests therefore have deterministic, non-overlapping order.
-- Continuations are namespaced by tenant and `agent_ref`; the same response ID
-  may safely exist for unrelated agents or tenants.
+- Continuations and stored responses are namespaced by tenant, owner, and
+  `agent_ref`; the same response ID may safely exist for unrelated owners,
+  agents, or tenants. Migration `0008` backfills continuation owners from their
+  conversations before replacing the legacy uniqueness constraint.
+- Terminal public responses are immutable at the database layer. They retain
+  the response/previous-response IDs, terminal status, turn and continuation
+  links, transcript boundary, response and terminal timestamps, version marker,
+  canonical size, digest, and the complete public JSON object. Deleting or
+  truncating the owning conversation may remove them as part of normal ledger
+  lifecycle, but they cannot be updated in place.
 - Private continuation `state` is returned only through the continuation API.
-  A future capability system must prevent ordinary UI clients from reading it.
+  The ordinary response API selects only the public response object.
 - The replay endpoint is a convenience projection, not summarization. The
   canonical item ledger remains lossless.
 - Capability signatures bind tenant, owner, file ID, and expiry. Capability
