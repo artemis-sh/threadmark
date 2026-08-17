@@ -19,9 +19,10 @@ use crate::{
     model::{
         Actor, AppendItems, AppendResult, Continuation, ContinuationQuery, Conversation,
         CreateContinuation, CreateConversation, CreateDownload, CreateTurn, DownloadDelivery,
-        DownloadGrant, FileResponse, Item, ListConversationsQuery, ListItemsQuery,
-        RegenerateResult, ReplayRequest, ReplayResult, StartTurn, StartTurnResult, StrictJson,
-        TruncateConversation, Turn, UpdateConversation, UpdateTurn, validate_json_number_tokens,
+        DownloadGrant, FileResponse, FinalizeTurn, FinalizeTurnResult, Item,
+        ListConversationsQuery, ListItemsQuery, RegenerateResult, ReplayRequest, ReplayResult,
+        StartTurn, StartTurnResult, StrictJson, TruncateConversation, Turn, UpdateConversation,
+        UpdateTurn, validate_json_number_tokens,
     },
     object_store::ObjectStore,
     store, uploads,
@@ -60,6 +61,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/conversations/{id}/active-turn", get(get_active_turn))
         .route("/v1/turns/{id}", get(get_turn).patch(update_turn))
+        .route("/v1/agent-turns/{id}/finalize", post(finalize_turn))
         .route(
             "/v1/conversations/{id}/truncate",
             post(truncate_conversation),
@@ -284,6 +286,20 @@ async fn update_turn(
     auth.require(Permission::TurnUpdate)?;
     Ok(Json(
         store::update_turn(&state.pool, &auth, &id, request).await?,
+    ))
+}
+
+async fn finalize_turn(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(id): Path<String>,
+    Json(request): Json<FinalizeTurn>,
+) -> ApiResult<Json<FinalizeTurnResult>> {
+    auth.require(Permission::TranscriptAppend)?;
+    auth.require(Permission::TurnUpdate)?;
+    auth.require(Permission::ContinuationWrite)?;
+    Ok(Json(
+        store::finalize_turn(&state.pool, &auth, &id, request).await?,
     ))
 }
 

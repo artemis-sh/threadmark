@@ -35,6 +35,7 @@ pub struct StartTurn {
     pub conversation_id: Option<String>,
     pub conversation: Option<CreateConversation>,
     pub agent_ref: String,
+    pub response_id: String,
     pub items: Vec<Value>,
 }
 
@@ -353,6 +354,31 @@ pub struct Turn {
 pub struct CreateTurn {
     pub idempotency_key: String,
     pub agent_ref: String,
+    pub response_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FinalizeTurn {
+    pub idempotency_key: String,
+    pub response_id: String,
+    pub status: String,
+    pub output_items: Vec<Value>,
+    pub response: Value,
+    pub parent_response_id: Option<String>,
+    pub state: Option<Value>,
+    pub error: Option<Value>,
+    pub usage: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FinalizeTurnResult {
+    pub turn: Turn,
+    pub items: Vec<Item>,
+    pub continuation: Continuation,
+    pub response: Value,
+    pub first_seq: i64,
+    pub last_seq: i64,
+    pub replayed: bool,
 }
 
 #[derive(Debug, Deserialize)]
