@@ -12,8 +12,9 @@ use crate::{
     ids::new_id,
     model::{
         Actor, AppendItems, AppendResult, Continuation, Conversation, CreateContinuation,
-        CreateConversation, CreateTurn, FileDelivery, Item, ReplayRequest, ReplayResult, StartTurn,
-        StartTurnResult, Turn, UpdateConversation, UpdateTurn,
+        CreateConversation, CreateTurn, FileDelivery, FinalizeTurn, FinalizeTurnResult, Item,
+        ReplayRequest, ReplayResult, StartTurn, StartTurnResult, Turn, UpdateConversation,
+        UpdateTurn,
     },
 };
 
@@ -25,6 +26,7 @@ enum TurnStartDigest<'a> {
         version: i16,
         conversation_id: &'a str,
         agent_ref: &'a str,
+        response_id: &'a str,
         items: &'a [Value],
     },
     Create {
@@ -32,6 +34,7 @@ enum TurnStartDigest<'a> {
         version: i16,
         conversation: &'a CreateConversation,
         agent_ref: &'a str,
+        response_id: &'a str,
         items: &'a [Value],
     },
 }
@@ -63,6 +66,7 @@ fn turn_start_digest_v1(request: &StartTurn) -> ApiResult<Vec<u8>> {
             version: 1,
             conversation_id,
             agent_ref: &request.agent_ref,
+            response_id: &request.response_id,
             items: &request.items,
         },
         (None, Some(conversation)) => TurnStartDigest::Create {
@@ -70,6 +74,7 @@ fn turn_start_digest_v1(request: &StartTurn) -> ApiResult<Vec<u8>> {
             version: 1,
             conversation,
             agent_ref: &request.agent_ref,
+            response_id: &request.response_id,
             items: &request.items,
         },
         _ => unreachable!("conversation mode validated"),
@@ -77,6 +82,39 @@ fn turn_start_digest_v1(request: &StartTurn) -> ApiResult<Vec<u8>> {
     Ok(Sha256::digest(
         serde_json_canonicalizer::to_vec(&digest_input)
             .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?,
+    )
+    .to_vec())
+}
+
+#[derive(Serialize)]
+struct TurnFinalizeDigest<'a> {
+    operation: &'static str,
+    version: i16,
+    response_id: &'a str,
+    status: &'a str,
+    output_items: &'a [Value],
+    response: &'a Value,
+    parent_response_id: &'a Option<String>,
+    state: &'a Option<Value>,
+    error: &'a Option<Value>,
+    usage: &'a Option<Value>,
+}
+
+fn turn_finalize_digest_v1(request: &FinalizeTurn) -> ApiResult<Vec<u8>> {
+    Ok(Sha256::digest(
+        serde_json_canonicalizer::to_vec(&TurnFinalizeDigest {
+            operation: "turn_finalize",
+            version: 1,
+            response_id: &request.response_id,
+            status: &request.status,
+            output_items: &request.output_items,
+            response: &request.response,
+            parent_response_id: &request.parent_response_id,
+            state: &request.state,
+            error: &request.error,
+            usage: &request.usage,
+        })
+        .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?,
     )
     .to_vec())
 }
@@ -307,6 +345,7 @@ pub async fn start_turn(
 ) -> ApiResult<StartTurnResult> {
     request.idempotency_key = request.idempotency_key.trim().to_owned();
     request.agent_ref = request.agent_ref.trim().to_owned();
+    request.response_id = request.response_id.trim().to_owned();
     if request.idempotency_key.is_empty() || request.idempotency_key.chars().count() > 200 {
         return Err(ApiError::BadRequest(
             "idempotency_key must contain 1 to 200 characters".into(),
@@ -315,6 +354,11 @@ pub async fn start_turn(
     if request.agent_ref.is_empty() || request.agent_ref.chars().count() > 200 {
         return Err(ApiError::BadRequest(
             "agent_ref must contain 1 to 200 characters".into(),
+        ));
+    }
+    if request.response_id.is_empty() || request.response_id.chars().count() > 200 {
+        return Err(ApiError::BadRequest(
+            "response_id must contain 1 to 200 characters".into(),
         ));
     }
     if request.conversation_id.is_some() == request.conversation.is_some() {
@@ -502,12 +546,13 @@ pub async fn start_turn(
 
     let turn_id = new_id("turn");
     let turn_insert = sqlx::query(
-        "INSERT INTO turns (id, conversation_id, agent_ref, idempotency_key)
-         VALUES ($1, $2, $3, NULL)",
+        "INSERT INTO turns (id, conversation_id, agent_ref, idempotency_key, reserved_response_id)
+         VALUES ($1, $2, $3, NULL, $4)",
     )
     .bind(&turn_id)
     .bind(&conversation.id)
     .bind(&request.agent_ref)
+    .bind(&request.response_id)
     .execute(&mut *tx)
     .await;
     if let Err(error) = turn_insert {
@@ -980,6 +1025,18 @@ pub async fn create_turn(
                 "idempotency_key was already used for a different agent",
             ));
         }
+        let reserved_response_id = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT reserved_response_id FROM turns WHERE id = $1",
+        )
+        .bind(&turn.id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if reserved_response_id.as_deref() != Some(request.response_id.trim()) {
+            return Err(coded_conflict(
+                "idempotency_key_reused",
+                "idempotency_key was already used for a different response_id",
+            ));
+        }
         tx.commit().await?;
         return Ok(turn);
     }
@@ -987,9 +1044,11 @@ pub async fn create_turn(
         || agent_ref.chars().count() > 200
         || idempotency_key.trim().is_empty()
         || idempotency_key.chars().count() > 200
+        || request.response_id.trim().is_empty()
+        || request.response_id.chars().count() > 200
     {
         return Err(ApiError::BadRequest(
-            "agent_ref and idempotency_key must contain 1 to 200 characters".into(),
+            "agent_ref, idempotency_key, and response_id must contain 1 to 200 characters".into(),
         ));
     }
     let active = sqlx::query_scalar::<_, bool>(
@@ -1007,13 +1066,14 @@ pub async fn create_turn(
     }
     lock_turn_files(&mut tx, actor, conversation_id, &[]).await?;
     let turn = sqlx::query_as::<_, Turn>(
-        "INSERT INTO turns (id, conversation_id, agent_ref, idempotency_key)
-         VALUES ($1, $2, $3, $4) RETURNING *",
+        "INSERT INTO turns (id, conversation_id, agent_ref, idempotency_key, reserved_response_id)
+         VALUES ($1, $2, $3, $4, $5) RETURNING *",
     )
     .bind(new_id("turn"))
     .bind(conversation_id)
     .bind(agent_ref)
     .bind(idempotency_key)
+    .bind(request.response_id.trim())
     .fetch_one(&mut *tx)
     .await;
     let turn = match turn {
@@ -1167,10 +1227,11 @@ pub async fn update_turn(
     );
     sqlx::query_as::<_, Turn>(
         "UPDATE turns SET status = $1, response_id = $2, error = $3, usage = $4,
-             completed_at = CASE WHEN $5 THEN COALESCE(completed_at, now()) ELSE NULL END
-         WHERE id = $6 AND conversation_id IN
-             (SELECT id FROM conversations WHERE tenant_id = $7 AND owner_ref = $8)
-         RETURNING *",
+              completed_at = CASE WHEN $5 THEN COALESCE(completed_at, now()) ELSE NULL END
+          WHERE id = $6 AND conversation_id IN
+              (SELECT id FROM conversations WHERE tenant_id = $7 AND owner_ref = $8)
+            AND status IN ('pending', 'streaming')
+          RETURNING *",
     )
     .bind(request.status)
     .bind(request.response_id)
@@ -1183,6 +1244,316 @@ pub async fn update_turn(
     .fetch_optional(pool)
     .await?
     .ok_or_else(|| ApiError::NotFound("Turn not found.".into()))
+}
+
+pub async fn finalize_turn(
+    pool: &PgPool,
+    auth: &crate::auth::AuthContext,
+    turn_id: &str,
+    mut request: FinalizeTurn,
+) -> ApiResult<FinalizeTurnResult> {
+    request.idempotency_key = request.idempotency_key.trim().to_owned();
+    request.response_id = request.response_id.trim().to_owned();
+    request.status = request.status.trim().to_owned();
+    if request.idempotency_key.is_empty()
+        || request.idempotency_key.chars().count() > 200
+        || request.response_id.is_empty()
+        || request.response_id.chars().count() > 200
+    {
+        return Err(ApiError::BadRequest(
+            "idempotency_key and response_id must contain 1 to 200 characters".into(),
+        ));
+    }
+    if !matches!(
+        request.status.as_str(),
+        "completed" | "incomplete" | "failed" | "cancelled"
+    ) {
+        return Err(ApiError::BadRequest("status must be terminal".into()));
+    }
+    if request.output_items.len() > 100
+        || request.output_items.iter().any(|item| !item.is_object())
+    {
+        return Err(ApiError::BadRequest(
+            "output_items must contain at most 100 JSON objects".into(),
+        ));
+    }
+    if !request.response.is_object() {
+        return Err(ApiError::BadRequest("response must be a JSON object".into()));
+    }
+    if request
+        .parent_response_id
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty() || value.chars().count() > 200)
+    {
+        return Err(ApiError::BadRequest(
+            "parent_response_id must contain 1 to 200 characters when supplied".into(),
+        ));
+    }
+    let request_digest = turn_finalize_digest_v1(&request)?;
+    let response_digest = Sha256::digest(
+        serde_json_canonicalizer::to_vec(&request.response)
+            .map_err(|error| ApiError::BadRequest(format!("invalid response JSON: {error}")))?,
+    )
+    .to_vec();
+
+    let mut tx = pool.begin().await?;
+    // Lock the conversation before the turn, matching all transcript writers.
+    let (conversation_id, turn_agent_ref, _, _) =
+        sqlx::query_as::<_, (String, String, String, Option<String>)>(
+            "SELECT t.conversation_id, t.agent_ref, t.status, t.reserved_response_id
+             FROM turns t JOIN conversations c ON c.id = t.conversation_id
+             WHERE t.id = $1 AND c.tenant_id = $2 AND c.owner_ref = $3",
+        )
+        .bind(turn_id)
+        .bind(&auth.tenant_id)
+        .bind(&auth.principal_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Turn not found.".into()))?;
+    auth.require_agent(&turn_agent_ref)?;
+    let conversation = lock_conversation(&mut tx, auth, &conversation_id).await?;
+    // Re-read under a row lock after acquiring the conversation lock.
+    let (turn_agent_ref, status, reserved_response_id) =
+        sqlx::query_as::<_, (String, String, Option<String>)>(
+            "SELECT agent_ref, status, reserved_response_id FROM turns WHERE id = $1 FOR UPDATE",
+        )
+        .bind(turn_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    auth.require_agent(&turn_agent_ref)?;
+
+    if let Some((version, digest, response, first_seq, last_seq, continuation_id)) =
+        sqlx::query_as::<_, (i16, Vec<u8>, Value, i64, i64, String)>(
+            "SELECT request_version, request_digest, response, first_seq, last_seq, continuation_id
+             FROM turn_finalizations WHERE turn_id = $1",
+        )
+        .bind(turn_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    {
+        if version != 1 {
+            return Err(coded_conflict(
+                "idempotency_version_unsupported",
+                "the original finalization version is not supported by this server",
+            ));
+        }
+        if digest != request_digest {
+            return Err(coded_conflict(
+                "finalization_reused",
+                "turn was already finalized with a different request",
+            ));
+        }
+        let turn = sqlx::query_as::<_, Turn>("SELECT * FROM turns WHERE id = $1")
+            .bind(turn_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let continuation = sqlx::query_as::<_, Continuation>(
+            "SELECT * FROM continuations WHERE id = $1",
+        )
+        .bind(continuation_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            coded_conflict(
+                "idempotency_result_deleted",
+                "the original finalization result is no longer available",
+            )
+        })?;
+        let items = if last_seq < first_seq {
+            Vec::new()
+        } else {
+            sqlx::query_as::<_, Item>(
+                "SELECT * FROM conversation_items WHERE conversation_id = $1
+                 AND turn_id = $2 AND seq BETWEEN $3 AND $4 ORDER BY seq ASC",
+            )
+            .bind(&conversation_id)
+            .bind(turn_id)
+            .bind(first_seq)
+            .bind(last_seq)
+            .fetch_all(&mut *tx)
+            .await?
+        };
+        tx.commit().await?;
+        return Ok(FinalizeTurnResult {
+            turn,
+            items,
+            continuation,
+            response,
+            first_seq,
+            last_seq,
+            replayed: true,
+        });
+    }
+
+    if reserved_response_id.as_deref() != Some(request.response_id.as_str()) {
+        return Err(coded_conflict(
+            "response_id_mismatch",
+            "response_id does not match the response ID reserved for this turn",
+        ));
+    }
+    if !matches!(status.as_str(), "pending" | "streaming") {
+        return Err(coded_conflict(
+            "turn_not_active",
+            "only an active turn can be finalized",
+        ));
+    }
+    if sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM turn_finalizations
+         WHERE tenant_id = $1 AND agent_ref = $2 AND response_id = $3)",
+    )
+    .bind(&auth.tenant_id)
+    .bind(&turn_agent_ref)
+    .bind(&request.response_id)
+    .fetch_one(&mut *tx)
+    .await?
+    {
+        return Err(coded_conflict(
+            "response_id_reused",
+            "response_id was already finalized for this agent",
+        ));
+    }
+    if sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM turn_finalizations
+         WHERE tenant_id = $1 AND owner_ref = $2 AND agent_ref = $3 AND idempotency_key = $4)",
+    )
+    .bind(&auth.tenant_id)
+    .bind(&auth.principal_id)
+    .bind(&turn_agent_ref)
+    .bind(&request.idempotency_key)
+    .fetch_one(&mut *tx)
+    .await?
+    {
+        return Err(coded_conflict(
+            "idempotency_key_reused",
+            "idempotency_key was already used to finalize a different turn",
+        ));
+    }
+    if sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM continuations
+         WHERE tenant_id = $1 AND agent_ref = $2 AND response_id = $3)",
+    )
+    .bind(&auth.tenant_id)
+    .bind(&turn_agent_ref)
+    .bind(&request.response_id)
+    .fetch_one(&mut *tx)
+    .await?
+    {
+        return Err(coded_conflict(
+            "response_id_reused",
+            "response_id already has a continuation for this agent",
+        ));
+    }
+
+    let mut file_ids = request
+        .output_items
+        .iter()
+        .flat_map(referenced_file_ids)
+        .collect::<Vec<_>>();
+    file_ids.sort();
+    file_ids.dedup();
+    lock_turn_files(&mut tx, auth, &conversation_id, &file_ids).await?;
+
+    let first_seq = conversation.next_seq;
+    let last_seq = first_seq + request.output_items.len() as i64 - 1;
+    let mut items = Vec::with_capacity(request.output_items.len());
+    for (offset, payload) in request.output_items.into_iter().enumerate() {
+        let file_ids = referenced_file_ids(&payload);
+        let item = sqlx::query_as::<_, Item>(
+            "INSERT INTO conversation_items (id, conversation_id, turn_id, seq, source, payload)
+             VALUES ($1, $2, $3, $4, 'agent', $5) RETURNING *",
+        )
+        .bind(new_id("item"))
+        .bind(&conversation_id)
+        .bind(turn_id)
+        .bind(first_seq + offset as i64)
+        .bind(payload)
+        .fetch_one(&mut *tx)
+        .await?;
+        for file_id in file_ids {
+            sqlx::query("INSERT INTO conversation_item_files (item_id, file_id) VALUES ($1, $2)")
+                .bind(&item.id)
+                .bind(file_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        items.push(item);
+    }
+    let through_seq = last_seq.max(0);
+    let continuation = sqlx::query_as::<_, Continuation>(
+        "INSERT INTO continuations
+         (id, tenant_id, conversation_id, agent_ref, response_id, parent_response_id, through_seq, state)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (tenant_id, agent_ref, response_id) DO NOTHING RETURNING *",
+    )
+    .bind(new_id("cont"))
+    .bind(&auth.tenant_id)
+    .bind(&conversation_id)
+    .bind(&turn_agent_ref)
+    .bind(&request.response_id)
+    .bind(&request.parent_response_id)
+    .bind(through_seq)
+    .bind(&request.state)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| {
+        coded_conflict(
+            "response_id_reused",
+            "response_id already has a continuation for this agent",
+        )
+    })?;
+    sqlx::query("UPDATE conversations SET next_seq = $2, updated_at = now() WHERE id = $1")
+        .bind(&conversation_id)
+        .bind(last_seq + 1)
+        .execute(&mut *tx)
+        .await?;
+    let turn = sqlx::query_as::<_, Turn>(
+        "UPDATE turns SET status = $1, response_id = $2, error = $3, usage = $4,
+         completed_at = COALESCE(completed_at, now()) WHERE id = $5 RETURNING *",
+    )
+    .bind(&request.status)
+    .bind(&request.response_id)
+    .bind(&request.error)
+    .bind(&request.usage)
+    .bind(turn_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let finalization_insert = sqlx::query(
+        "INSERT INTO turn_finalizations
+         (turn_id, tenant_id, owner_ref, agent_ref, idempotency_key, response_id, request_version,
+          request_digest, response, response_digest, first_seq, last_seq, continuation_id)
+         VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, $9, $10, $11, $12)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(turn_id)
+    .bind(&auth.tenant_id)
+    .bind(&auth.principal_id)
+    .bind(&turn_agent_ref)
+    .bind(&request.idempotency_key)
+    .bind(&request.response_id)
+    .bind(request_digest)
+    .bind(&request.response)
+    .bind(response_digest)
+    .bind(first_seq)
+    .bind(last_seq)
+    .bind(&continuation.id)
+    .execute(&mut *tx)
+    .await?;
+    if finalization_insert.rows_affected() == 0 {
+        return Err(coded_conflict(
+            "finalization_conflict",
+            "a finalization with this idempotency key or response_id already exists",
+        ));
+    }
+    tx.commit().await?;
+    Ok(FinalizeTurnResult {
+        turn,
+        items,
+        continuation,
+        response: request.response,
+        first_seq,
+        last_seq,
+        replayed: false,
+    })
 }
 
 pub async fn create_continuation(
@@ -1353,5 +1724,27 @@ mod tests {
             referenced_file_ids(&value),
             vec!["file_document".to_owned(), "file_image".to_owned()]
         );
+    }
+
+    #[test]
+    fn finalization_digest_binds_terminal_outcome_and_response() {
+        let request = FinalizeTurn {
+            idempotency_key: "finish-1".into(),
+            response_id: "resp_1".into(),
+            status: "completed".into(),
+            output_items: vec![json!({"type": "message", "role": "assistant"})],
+            response: json!({"id": "resp_1", "status": "completed"}),
+            parent_response_id: None,
+            state: Some(json!({"provider_thread": "thread_1"})),
+            error: None,
+            usage: Some(json!({"total_tokens": 3})),
+        };
+        let original = turn_finalize_digest_v1(&request).unwrap();
+        let mut changed = request;
+        changed.status = "failed".into();
+        assert_ne!(original, turn_finalize_digest_v1(&changed).unwrap());
+        changed.status = "completed".into();
+        changed.response["status"] = json!("incomplete");
+        assert_ne!(original, turn_finalize_digest_v1(&changed).unwrap());
     }
 }

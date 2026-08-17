@@ -166,7 +166,7 @@ curl -sS http://localhost:8090/v1/conversations/conv_.../turns \
   -H 'content-type: application/json' \
   -H 'x-threadmark-tenant: acme' \
   -H 'x-threadmark-principal: user_123' \
-  -d '{"idempotency_key":"request-1","agent_ref":"research-agent/prod"}'
+  -d '{"idempotency_key":"request-1","agent_ref":"research-agent/prod","response_id":"resp_abc"}'
 ```
 
 Append an Open Responses user item:
@@ -238,6 +238,7 @@ GET /v1/continuations/resp_abc?agent_ref=research-agent%2Fprod
 | `POST` | `/v1/conversations/{id}/replay` | Build an Open Responses input array |
 | `POST` | `/v1/conversations/{id}/turns` | Create an idempotent turn |
 | `PATCH` | `/v1/turns/{id}` | Update turn state and outcome |
+| `POST` | `/v1/agent-turns/{id}/finalize` | Atomically store terminal output, response, checkpoint, and turn outcome |
 | `POST` | `/v1/conversations/{id}/continuations` | Record an agent checkpoint |
 | `GET` | `/v1/continuations/{response_id}` | Resolve an agent checkpoint |
 | `POST` | `/v1/files` | Upload a tenant-owned S3-backed file |
