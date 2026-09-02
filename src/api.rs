@@ -20,7 +20,8 @@ use crate::{
         Actor, AgentReplayResult, AppendItems, AppendResult, Continuation, ContinuationQuery,
         Conversation, CreateContinuation, CreateConversation, CreateDownload, CreateTurn,
         DownloadDelivery, DownloadGrant, FileResponse, Item, ListConversationsQuery,
-        ListItemsQuery, RegenerateResult, ReplayRequest, ReplayResult, StartTurn, StartTurnResult,
+        ListItemsQuery, RegenerateResult, ReplayRequest, ReplayResult, StartAgentTurn,
+        StartAgentTurnResult, StartTurn, StartTurnResult,
         StrictJson, TruncateConversation, Turn, UpdateConversation, UpdateTurn,
         validate_json_number_tokens,
     },
@@ -44,6 +45,7 @@ pub fn router(state: AppState) -> Router {
             get(list_conversations).post(create_conversation),
         )
         .route("/v1/turn-starts", post(start_turn))
+        .route("/v1/agent-turns", post(start_agent_turn))
         .route(
             "/v1/conversations/{id}",
             get(get_conversation)
@@ -138,6 +140,22 @@ async fn start_turn(
 }
 
 fn parse_start_turn(body: &[u8]) -> ApiResult<StartTurn> {
+    parse_strict_json(body)
+}
+
+async fn start_agent_turn(
+    State(state): State<AppState>, auth: AuthContext, body: Bytes,
+) -> ApiResult<(StatusCode, Json<StartAgentTurnResult>)> {
+    let request: StartAgentTurn = parse_strict_json(&body)?;
+    auth.require(Permission::TurnCreate)?;
+    auth.require(Permission::TranscriptAppend)?;
+    auth.require_agent(request.agent_ref.trim())?;
+    if request.previous_response_id.is_none() { auth.require(Permission::ConversationCreate)?; }
+    let result = store::start_agent_turn(&state.pool, &auth, request).await?;
+    Ok((if result.replayed { StatusCode::OK } else { StatusCode::CREATED }, Json(result)))
+}
+
+fn parse_strict_json<T: serde::de::DeserializeOwned>(body: &[u8]) -> ApiResult<T> {
     validate_json_number_tokens(body)
         .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?;
     let mut deserializer = serde_json::Deserializer::from_slice(body);

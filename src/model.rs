@@ -49,6 +49,25 @@ pub struct StartTurnResult {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct StartAgentTurn {
+    pub idempotency_key: String,
+    pub response_id: String,
+    pub previous_response_id: Option<String>,
+    pub agent_ref: String,
+    pub conversation: Option<CreateConversation>,
+    pub items: Vec<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StartAgentTurnResult {
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub predecessor_seq: Option<i64>,
+    pub input_seq: i64,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ListConversationsQuery {
     pub limit: Option<i64>,
 }

@@ -13,7 +13,8 @@ use crate::{
     model::{
         Actor, AgentReplayResult, AppendItems, AppendResult, Continuation, Conversation,
         CreateContinuation, CreateConversation, CreateTurn, FileDelivery, Item, ReplayRequest,
-        ReplayResult, StartTurn, StartTurnResult, Turn, UpdateConversation, UpdateTurn,
+        ReplayResult, StartAgentTurn, StartAgentTurnResult, StartTurn, StartTurnResult, Turn,
+        UpdateConversation, UpdateTurn,
     },
 };
 
@@ -34,6 +35,15 @@ enum TurnStartDigest<'a> {
         agent_ref: &'a str,
         items: &'a [Value],
     },
+}
+
+#[derive(Serialize)]
+struct AgentTurnDigest<'a> { response_id: &'a str, previous_response_id: Option<&'a str>, agent_ref: &'a str, conversation: Option<&'a CreateConversation>, items: &'a [Value] }
+
+fn agent_turn_digest(request: &StartAgentTurn) -> ApiResult<Vec<u8>> {
+    Ok(Sha256::digest(serde_json_canonicalizer::to_vec(&AgentTurnDigest {
+        response_id: &request.response_id, previous_response_id: request.previous_response_id.as_deref(), agent_ref: &request.agent_ref, conversation: request.conversation.as_ref(), items: &request.items,
+    }).map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?).to_vec())
 }
 
 fn coded_conflict(code: &'static str, message: &str) -> ApiError {
@@ -608,6 +618,61 @@ pub async fn start_turn(
         last_seq,
         replayed: false,
     })
+}
+
+pub async fn start_agent_turn(pool: &PgPool, auth: &crate::auth::AuthContext, mut request: StartAgentTurn) -> ApiResult<StartAgentTurnResult> {
+    request.idempotency_key = request.idempotency_key.trim().to_owned();
+    request.response_id = request.response_id.trim().to_owned();
+    request.agent_ref = request.agent_ref.trim().to_owned();
+    if request.idempotency_key.is_empty() || request.response_id.is_empty() || request.agent_ref.is_empty() || request.items.is_empty() || request.items.len() > 100 || request.items.iter().any(|item| !item.is_object()) {
+        return Err(ApiError::BadRequest("idempotency_key, response_id, agent_ref, and 1 to 100 JSON items are required".into()));
+    }
+    if request.previous_response_id.is_some() == request.conversation.is_some() { return Err(ApiError::BadRequest("conversation is required only without previous_response_id".into())); }
+    if let Some(conversation) = &mut request.conversation {
+        if !conversation.metadata.is_object() { return Err(ApiError::BadRequest("metadata must be a JSON object".into())); }
+        conversation.title = Some(normalize_title(conversation.title.as_deref())?);
+    }
+    let digest = agent_turn_digest(&request)?;
+    let mut tx = pool.begin().await?;
+    if let Some((stored, conversation_id, turn_id, predecessor_seq, input_seq)) = sqlx::query_as::<_, (Vec<u8>, String, String, Option<i64>, i64)>("SELECT request_digest, conversation_id, turn_id, predecessor_seq, input_seq FROM agent_turn_starts WHERE tenant_id=$1 AND owner_ref=$2 AND client_id=$3 AND idempotency_key=$4 FOR UPDATE")
+        .bind(&auth.tenant_id).bind(&auth.principal_id).bind(&auth.client_id).bind(&request.idempotency_key).fetch_optional(&mut *tx).await? {
+        if stored != digest { return Err(coded_conflict("idempotency_key_reused", "idempotency_key was already used for a different request")); }
+        tx.commit().await?;
+        return Ok(StartAgentTurnResult { conversation_id, turn_id, predecessor_seq, input_seq, replayed: true });
+    }
+    if let Some((stored, conversation_id, turn_id, predecessor_seq, input_seq)) = sqlx::query_as::<_, (Vec<u8>, String, String, Option<i64>, i64)>("SELECT request_digest, conversation_id, turn_id, predecessor_seq, input_seq FROM agent_turn_starts WHERE tenant_id=$1 AND owner_ref=$2 AND agent_ref=$3 AND response_id=$4 FOR UPDATE")
+        .bind(&auth.tenant_id).bind(&auth.principal_id).bind(&request.agent_ref).bind(&request.response_id).fetch_optional(&mut *tx).await? {
+        if stored == digest { tx.commit().await?; return Ok(StartAgentTurnResult { conversation_id, turn_id, predecessor_seq, input_seq, replayed: true }); }
+        return Err(coded_conflict("response_id_reused", "response_id is already reserved"));
+    }
+    let (conversation, predecessor_seq) = if let Some(previous) = &request.previous_response_id {
+        let predecessor = sqlx::query_as::<_, (String, i64, String)>("SELECT c.conversation_id, c.through_seq, t.status FROM continuations c JOIN conversations v ON v.id=c.conversation_id JOIN turns t ON t.conversation_id=v.id AND t.response_id=c.response_id WHERE c.tenant_id=$1 AND v.owner_ref=$2 AND c.agent_ref=$3 AND c.response_id=$4 FOR UPDATE OF v, t")
+            .bind(&auth.tenant_id).bind(&auth.principal_id).bind(&request.agent_ref).bind(previous).fetch_optional(&mut *tx).await?
+            .ok_or_else(|| ApiError::NotFound("Continuation not found.".into()))?;
+        if predecessor.2 != "completed" { return Err(coded_conflict("predecessor_not_terminal", "previous_response_id is not terminal")); }
+        let conversation = lock_conversation(&mut tx, auth, &predecessor.0).await?;
+        let child = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM agent_turn_starts WHERE tenant_id=$1 AND agent_ref=$2 AND previous_response_id=$3)").bind(&auth.tenant_id).bind(&request.agent_ref).bind(previous).fetch_one(&mut *tx).await?;
+        if child { return Err(coded_conflict("continuation_not_head", "previous_response_id already has a continuation")); }
+        (conversation, Some(predecessor.1))
+    } else {
+        let new = request.conversation.as_ref().expect("validated new conversation");
+        (sqlx::query_as::<_, Conversation>("INSERT INTO conversations (id, tenant_id, owner_ref, title, metadata) VALUES ($1,$2,$3,$4,$5) RETURNING *").bind(new_id("conv")).bind(&auth.tenant_id).bind(&auth.principal_id).bind(new.title.as_deref().expect("normalized title")).bind(&new.metadata).fetch_one(&mut *tx).await?, None)
+    };
+    let active = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM turns WHERE conversation_id=$1 AND status IN ('pending','streaming'))").bind(&conversation.id).fetch_one(&mut *tx).await?;
+    if active { return Err(coded_conflict("active_turn_exists", "conversation already has an active turn")); }
+    let turn_id = new_id("turn");
+    sqlx::query("INSERT INTO turns (id, conversation_id, agent_ref, idempotency_key, response_id) VALUES ($1,$2,$3,NULL,$4)").bind(&turn_id).bind(&conversation.id).bind(&request.agent_ref).bind(&request.response_id).execute(&mut *tx).await?;
+    create_turn_file_snapshot(&mut tx, &conversation.id, &turn_id).await?;
+    let first_seq = conversation.next_seq;
+    let input_seq = first_seq.checked_add(request.items.len() as i64 - 1).ok_or_else(|| coded_conflict("sequence_space_exhausted", "sequence space exhausted"))?;
+    for (offset, payload) in request.items.into_iter().enumerate() {
+        sqlx::query("INSERT INTO conversation_items (id, conversation_id, turn_id, seq, source, payload) VALUES ($1,$2,$3,$4,'user',$5)").bind(new_id("item")).bind(&conversation.id).bind(&turn_id).bind(first_seq + offset as i64).bind(payload).execute(&mut *tx).await?;
+    }
+    sqlx::query("UPDATE conversations SET next_seq=$2, updated_at=now() WHERE id=$1").bind(&conversation.id).bind(input_seq + 1).execute(&mut *tx).await?;
+    let insert = sqlx::query("INSERT INTO agent_turn_starts (id,tenant_id,owner_ref,client_id,idempotency_key,request_digest,agent_ref,response_id,previous_response_id,conversation_id,turn_id,predecessor_seq,input_seq) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)").bind(new_id("astart")).bind(&auth.tenant_id).bind(&auth.principal_id).bind(&auth.client_id).bind(&request.idempotency_key).bind(digest).bind(&request.agent_ref).bind(&request.response_id).bind(&request.previous_response_id).bind(&conversation.id).bind(&turn_id).bind(predecessor_seq).bind(input_seq).execute(&mut *tx).await;
+    if let Err(error) = insert { match error.as_database_error().and_then(|error| error.constraint()) { Some("agent_turn_starts_one_child_idx") => return Err(coded_conflict("continuation_not_head", "previous_response_id already has a continuation")), Some("agent_turn_starts_tenant_id_agent_ref_response_id_key") => return Err(coded_conflict("response_id_reused", "response_id is already reserved")), _ => return Err(error.into()) } }
+    tx.commit().await?;
+    Ok(StartAgentTurnResult { conversation_id: conversation.id, turn_id, predecessor_seq, input_seq, replayed: false })
 }
 
 fn turn_start_lock_key(tenant: &str, owner: &str, client: &str, key: &str) -> i64 {
