@@ -64,7 +64,9 @@ pub enum Permission {
     ConversationRegenerate,
     TranscriptRead,
     AgentReplay,
+    AgentFinalize,
     TranscriptAppend,
+    TranscriptAppendAgent,
     TurnCreate,
     TurnRead,
     TurnUpdate,
@@ -280,17 +282,36 @@ impl Claims {
             .iter()
             .map(|value| Permission::parse(value))
             .collect::<Option<HashSet<_>>>()?;
-        if token_kind == TokenKind::DelegatedAgent
-            && (self.conversation_id.is_none()
+        if token_kind == TokenKind::DelegatedAgent {
+            let allowed = [
+                Permission::TranscriptRead,
+                Permission::TranscriptAppendAgent,
+                Permission::TurnRead,
+                Permission::TurnUpdate,
+                Permission::ContinuationRead,
+                Permission::ContinuationWrite,
+                Permission::FileRead,
+            ];
+            if self.conversation_id.is_none()
                 || self.turn_id.is_none()
                 || self.agent_ref.is_none()
-                || permissions.len() != 1
-                || !permissions.contains(&Permission::TranscriptRead))
-        {
-            return None;
-        }
-        if token_kind == TokenKind::DelegatedAgent {
-            permissions = [Permission::AgentReplay].into_iter().collect();
+                || permissions.is_empty()
+                || !permissions.iter().all(|permission| allowed.contains(permission))
+            {
+                return None;
+            }
+            if permissions.remove(&Permission::TranscriptRead) {
+                permissions.insert(Permission::AgentReplay);
+            }
+            if permissions.contains(&Permission::TranscriptAppendAgent)
+                && permissions.contains(&Permission::TurnUpdate)
+                && permissions.contains(&Permission::ContinuationWrite)
+            {
+                permissions.insert(Permission::AgentFinalize);
+            }
+            permissions.retain(|permission| {
+                matches!(permission, Permission::AgentReplay | Permission::AgentFinalize)
+            });
         }
         Some(AuthContext {
             actor: Actor {
@@ -319,6 +340,10 @@ impl AuthContext {
         self.agent_ref.as_deref()
     }
 
+    pub fn conversation_id(&self) -> Option<&str> {
+        self.conversation_id.as_deref()
+    }
+
     pub fn require_agent(&self, agent_ref: &str) -> Result<(), ApiError> {
         match &self.agent_ref {
             Some(bound) if bound != agent_ref => {
@@ -342,6 +367,22 @@ impl AuthContext {
         self.agent_ref
             .as_deref()
             .ok_or_else(|| ApiError::NotFound("Agent replay not found.".into()))
+    }
+
+    pub fn require_agent_turn_scope(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> Result<&str, ApiError> {
+        if self.token_kind != TokenKind::DelegatedAgent
+            || self.conversation_id.as_deref() != Some(conversation_id)
+            || self.turn_id.as_deref() != Some(turn_id)
+        {
+            return Err(ApiError::NotFound("Agent turn not found.".into()));
+        }
+        self.agent_ref
+            .as_deref()
+            .ok_or_else(|| ApiError::NotFound("Agent turn not found.".into()))
     }
 }
 
@@ -376,6 +417,7 @@ impl Permission {
             "conversation:regenerate" => Self::ConversationRegenerate,
             "transcript:read" => Self::TranscriptRead,
             "transcript:append" => Self::TranscriptAppend,
+            "transcript:append_agent" => Self::TranscriptAppendAgent,
             "turn:create" => Self::TurnCreate,
             "turn:read" => Self::TurnRead,
             "turn:update" => Self::TurnUpdate,
@@ -587,6 +629,36 @@ mod tests {
         ));
         assert!(matches!(
             context.require_agent_replay_scope("conv_1", "turn_other"),
+            Err(ApiError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn delegated_finalize_token_requires_write_permissions_and_bounds() {
+        let mut claims = claims();
+        claims["token_kind"] = json!("delegated_agent");
+        claims["permissions"] = json!([
+            "transcript:append_agent",
+            "turn:update",
+            "continuation:write"
+        ]);
+        claims["conversation_id"] = json!("conv_1");
+        claims["turn_id"] = json!("turn_1");
+        claims["agent_ref"] = json!("bonsai/prod");
+        let context = verifier().authenticate(&headers(&claims)).unwrap();
+        assert!(context.require(Permission::AgentFinalize).is_ok());
+        assert!(matches!(
+            context.require(Permission::TurnUpdate),
+            Err(ApiError::Forbidden)
+        ));
+        assert_eq!(
+            context
+                .require_agent_turn_scope("conv_1", "turn_1")
+                .unwrap(),
+            "bonsai/prod"
+        );
+        assert!(matches!(
+            context.require_agent_turn_scope("conv_1", "turn_other"),
             Err(ApiError::NotFound(_))
         ));
     }

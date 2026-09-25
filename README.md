@@ -78,6 +78,7 @@ This is an experiment and its API is not stable. The current slice establishes:
 - Cursor-based item reads.
 - Open Responses replay projection with optional top-level `id` removal.
 - Snapshot-consistent, size-bounded text replay for delegated agent turns.
+- Atomic, idempotent agent turn finalization with durable terminal responses.
 - Agent-scoped continuation records and optional private checkpoint state.
 
 Editing, branching, retention, event delivery, production authentication, and
@@ -141,8 +142,8 @@ mode. Production uses
 `AUTH_MODE=jwt` with `AUTH_ISSUER`, `AUTH_AUDIENCE`, and an HTTPS
 `AUTH_JWKS_URL`. JWT mode accepts Ed25519 `at+jwt` owner-session tokens and
 derives tenant, principal, and endpoint permissions exclusively from verified
-claims. It also accepts delegated-agent tokens only for the agent replay
-operation described below. Delegated writes remain disabled.
+claims. Delegated-agent tokens support the bounded replay and atomic
+finalization operations described below.
 
 An agent called by Parley can receive a short-lived token scoped to the same
 tenant, principal, conversation, turn, and agent deployment. That authorization
@@ -188,6 +189,23 @@ Exceeding either limit returns HTTP `413` with
 
 The existing owner endpoint, `POST /v1/conversations/{id}/replay`, is unchanged:
 it remains an opaque, multimodal projection with caller-selected file delivery.
+
+### Atomic agent finalization
+
+`POST /v1/agent-turns/{turn_id}/finalize` requires a delegated token bound to
+the turn, conversation, and agent with `transcript:append_agent`, `turn:update`,
+and `continuation:write`. The request supplies an idempotency key, the response
+ID reserved by turn creation, a terminal status (`completed`, `incomplete`,
+`failed`, or `cancelled`), ordered output `items`, the exact public `response`,
+optional `error` and `usage`, and optional `parent_response_id` and
+`continuation_state`.
+
+Output insertion, response storage, continuation creation, and the terminal
+turn transition share one database transaction. An exact retry returns the
+same sequence boundary, continuation, and stored response with `replayed=true`;
+a changed retry returns a typed `409` conflict. Terminal turns and finalized
+output are immutable. Turn-start responses include the reserved `response_id`
+that must be supplied at finalization.
 
 ## Example flow
 
@@ -279,6 +297,7 @@ GET /v1/continuations/resp_abc?agent_ref=research-agent%2Fprod
 | `POST` | `/v1/conversations/{id}/items` | Atomically append an idempotent item batch |
 | `POST` | `/v1/conversations/{id}/replay` | Build an Open Responses input array |
 | `POST` | `/v1/conversations/{conversation_id}/turns/{turn_id}/agent-replay` | Build bounded text input for a delegated agent turn |
+| `POST` | `/v1/agent-turns/{turn_id}/finalize` | Atomically persist agent output and its terminal result |
 | `POST` | `/v1/conversations/{id}/turns` | Create an idempotent turn |
 | `PATCH` | `/v1/turns/{id}` | Update turn state and outcome |
 | `POST` | `/v1/conversations/{id}/continuations` | Record an agent checkpoint |
@@ -295,8 +314,8 @@ GET /v1/continuations/resp_abc?agent_ref=research-agent%2Fprod
   item to be a JSON object.
 - Sequence numbers are allocated while locking the conversation row. Concurrent
   append requests therefore have deterministic, non-overlapping order.
-- Continuations are namespaced by tenant and `agent_ref`; the same response ID
-  may safely exist for unrelated agents or tenants.
+- Continuations are namespaced by tenant, owner, and `agent_ref`; the same
+  response ID may safely exist for unrelated owners, agents, or tenants.
 - Private continuation `state` is returned only through the continuation API.
   A future capability system must prevent ordinary UI clients from reading it.
 - The replay endpoint is a convenience projection, not summarization. The
