@@ -19,10 +19,10 @@ use crate::{
     model::{
         Actor, AgentReplayResult, AppendItems, AppendResult, Continuation, ContinuationQuery,
         Conversation, CreateContinuation, CreateConversation, CreateDownload, CreateTurn,
-        DownloadDelivery, DownloadGrant, FileResponse, Item, ListConversationsQuery,
-        ListItemsQuery, RegenerateResult, ReplayRequest, ReplayResult, StartTurn, StartTurnResult,
-        StrictJson, TruncateConversation, Turn, UpdateConversation, UpdateTurn,
-        validate_json_number_tokens,
+        DownloadDelivery, DownloadGrant, FileResponse, FinalizeAgentTurn, FinalizeAgentTurnResult,
+        Item, ListConversationsQuery, ListItemsQuery, RegenerateResult, ReplayRequest,
+        ReplayResult, StartTurn, StartTurnResult, StrictJson, TruncateConversation, Turn,
+        UpdateConversation, UpdateTurn, validate_json_number_tokens,
     },
     object_store::ObjectStore,
     store, uploads,
@@ -44,6 +44,10 @@ pub fn router(state: AppState) -> Router {
             get(list_conversations).post(create_conversation),
         )
         .route("/v1/turn-starts", post(start_turn))
+        .route(
+            "/v1/agent-turns/{turn_id}/finalize",
+            post(finalize_agent_turn),
+        )
         .route(
             "/v1/conversations/{id}",
             get(get_conversation)
@@ -121,7 +125,7 @@ async fn start_turn(
     auth: AuthContext,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<StartTurnResult>)> {
-    let request = parse_start_turn(&body)?;
+    let request = parse_strict_json(&body)?;
     auth.require(Permission::TurnCreate)?;
     auth.require(Permission::TranscriptAppend)?;
     auth.require_agent(request.agent_ref.trim())?;
@@ -137,7 +141,10 @@ async fn start_turn(
     Ok((status, Json(result)))
 }
 
-fn parse_start_turn(body: &[u8]) -> ApiResult<StartTurn> {
+fn parse_strict_json<T>(body: &[u8]) -> ApiResult<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
     validate_json_number_tokens(body)
         .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?;
     let mut deserializer = serde_json::Deserializer::from_slice(body);
@@ -148,6 +155,41 @@ fn parse_start_turn(body: &[u8]) -> ApiResult<StartTurn> {
         .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))?;
     serde_json::from_value(value)
         .map_err(|error| ApiError::BadRequest(format!("invalid request JSON: {error}")))
+}
+
+async fn finalize_agent_turn(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(turn_id): Path<String>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<FinalizeAgentTurnResult>)> {
+    let request = parse_strict_json::<FinalizeAgentTurn>(&body)?;
+    auth.require(Permission::AgentFinalize)?;
+    let (conversation_id, agent_ref) = {
+        let conversation_id = auth
+            .conversation_id()
+            .ok_or_else(|| ApiError::NotFound("Agent turn not found.".into()))?
+            .to_owned();
+        let agent_ref = auth
+            .require_agent_turn_scope(&conversation_id, &turn_id)?
+            .to_owned();
+        (conversation_id, agent_ref)
+    };
+    let result = store::finalize_agent_turn(
+        &state.pool,
+        &auth,
+        &conversation_id,
+        &turn_id,
+        &agent_ref,
+        request,
+    )
+    .await?;
+    let status = if result.replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(result)))
 }
 
 async fn list_conversations(

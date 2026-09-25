@@ -42,6 +42,7 @@ pub struct StartTurn {
 pub struct StartTurnResult {
     pub conversation_id: String,
     pub turn_id: String,
+    pub response_id: String,
     pub item_ids: Vec<String>,
     pub first_seq: i64,
     pub last_seq: i64,
@@ -371,6 +372,36 @@ pub struct UpdateTurn {
     pub usage: Option<Value>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalizeAgentTurn {
+    pub idempotency_key: String,
+    pub response_id: String,
+    pub status: String,
+    pub items: Vec<Value>,
+    pub response: Value,
+    pub parent_response_id: Option<String>,
+    pub continuation_state: Option<Value>,
+    pub error: Option<Value>,
+    pub usage: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FinalizeAgentTurnResult {
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub response_id: String,
+    pub status: String,
+    pub item_ids: Vec<String>,
+    pub first_seq: Option<i64>,
+    pub last_seq: Option<i64>,
+    pub through_seq: i64,
+    pub continuation: Continuation,
+    pub response: Value,
+    pub response_digest: String,
+    pub replayed: bool,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct TruncateConversation {
     pub item_id: String,
@@ -385,7 +416,9 @@ pub struct RegenerateResult {
 pub struct Continuation {
     pub id: String,
     pub tenant_id: String,
+    pub owner_ref: String,
     pub conversation_id: String,
+    pub turn_id: Option<String>,
     pub agent_ref: String,
     pub response_id: String,
     pub parent_response_id: Option<String>,
