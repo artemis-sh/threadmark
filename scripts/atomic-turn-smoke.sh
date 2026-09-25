@@ -24,6 +24,7 @@ test "$(jq -r '.replayed' <<<"$created")" = false
 test "$(jq -r '.replayed' <<<"$replayed")" = true
 test "$(jq -r '.conversation_id' <<<"$created")" = "$(jq -r '.conversation_id' <<<"$replayed")"
 test "$(jq -r '.turn_id' <<<"$created")" = "$(jq -r '.turn_id' <<<"$replayed")"
+test "$(jq -r '.response_id' <<<"$created")" = "$(jq -r '.response_id' <<<"$replayed")"
 test "$(jq -c '.item_ids' <<<"$created")" = "$(jq -c '.item_ids' <<<"$replayed")"
 
 changed=$(jq '.items[0].content[0].text = "changed"' <<<"$request")
