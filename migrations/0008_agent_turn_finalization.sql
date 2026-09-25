@@ -26,7 +26,7 @@ CREATE TABLE agent_turn_finalizations (
     request_version smallint NOT NULL CHECK (request_version > 0),
     request_digest bytea NOT NULL CHECK (octet_length(request_digest) = 32),
     response_digest bytea NOT NULL CHECK (octet_length(response_digest) = 32),
-    conversation_id text NOT NULL,
+    conversation_id text NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     turn_id text NOT NULL UNIQUE,
     agent_ref text NOT NULL,
     response_id text NOT NULL,
@@ -51,7 +51,7 @@ CREATE TABLE agent_turn_finalizations (
 
 CREATE TABLE agent_turn_finalization_items (
     finalization_id text NOT NULL
-        REFERENCES agent_turn_finalizations(id) ON DELETE RESTRICT,
+        REFERENCES agent_turn_finalizations(id) ON DELETE CASCADE,
     ordinal integer NOT NULL CHECK (ordinal >= 0),
     item_id text NOT NULL,
     seq bigint NOT NULL CHECK (seq > 0),
